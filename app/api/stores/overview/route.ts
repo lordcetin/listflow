@@ -46,6 +46,12 @@ type SchedulerJobRow = {
   created_at: string | null;
 };
 
+type OrderCountRow = {
+  id: string;
+  store_id?: string | null;
+  payment_status?: string | null;
+};
+
 const isMissingColumnError = (error: { message?: string } | null | undefined, column: string) => {
   if (!error) {
     return false;
@@ -391,6 +397,76 @@ const loadStores = async (userId: string) => {
   throw new Error(lastErrorMessage);
 };
 
+const loadPaidOrderCounts = async (args: { userId: string; storeIds: string[] }) => {
+  const countsByStoreId = new Map<string, number>();
+  for (const storeId of args.storeIds) {
+    countsByStoreId.set(storeId, 0);
+  }
+
+  if (!args.storeIds.length) {
+    return {
+      countsByStoreId,
+      orphanPaidCount: 0,
+    };
+  }
+
+  const candidates = [
+    { select: "id, store_id, payment_status", hasStoreId: true, hasPaymentStatus: true },
+    { select: "id, payment_status", hasStoreId: false, hasPaymentStatus: true },
+    { select: "id, store_id", hasStoreId: true, hasPaymentStatus: false },
+    { select: "id", hasStoreId: false, hasPaymentStatus: false },
+  ] as const;
+
+  let lastErrorMessage = "orders could not be loaded";
+  const allowedStoreIds = new Set(args.storeIds);
+
+  for (const candidate of candidates) {
+    const query = await supabaseAdmin
+      .from("orders")
+      .select(candidate.select)
+      .eq("user_id", args.userId)
+      .limit(5000);
+
+    if (!query.error) {
+      const rows = (query.data ?? []) as unknown as OrderCountRow[];
+      let orphanPaidCount = 0;
+
+      for (const row of rows) {
+        if (candidate.hasPaymentStatus) {
+          const paymentStatus = (row.payment_status ?? "").toLowerCase();
+          if (paymentStatus !== "paid") {
+            continue;
+          }
+        } else {
+          continue;
+        }
+
+        const storeId = candidate.hasStoreId ? row.store_id ?? null : null;
+
+        if (storeId && allowedStoreIds.has(storeId)) {
+          countsByStoreId.set(storeId, (countsByStoreId.get(storeId) ?? 0) + 1);
+          continue;
+        }
+
+        orphanPaidCount += 1;
+      }
+
+      return {
+        countsByStoreId,
+        orphanPaidCount,
+      };
+    }
+
+    lastErrorMessage = query.error.message;
+
+    if (!isRecoverableColumnError(query.error, ["store_id", "payment_status"])) {
+      throw new Error(query.error.message);
+    }
+  }
+
+  throw new Error(lastErrorMessage);
+};
+
 const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
   if (!storeIds.length) {
     return new Map<string, string[]>();
@@ -535,6 +611,7 @@ export async function GET(request: NextRequest) {
     const { rows: stores, hasActiveWebhookColumn } = await loadStores(user.id);
     const subscriptions = await loadSubscriptions(user.id);
     const subscriptionIds = subscriptions.map((row) => row.id);
+    const storeIds = stores.map((store) => store.id);
 
     let schedulerJobs: SchedulerJobRow[] = [];
 
@@ -544,7 +621,17 @@ export async function GET(request: NextRequest) {
       schedulerJobs = [];
     }
 
-    const storeIds = stores.map((store) => store.id);
+    const { countsByStoreId, orphanPaidCount } = await loadPaidOrderCounts({
+      userId: user.id,
+      storeIds,
+    });
+
+    // Legacy orders created without store_id are assignable only when user has one store.
+    if (orphanPaidCount > 0 && storeIds.length === 1) {
+      const singleStoreId = storeIds[0];
+      countsByStoreId.set(singleStoreId, (countsByStoreId.get(singleStoreId) ?? 0) + orphanPaidCount);
+    }
+
     const fallbackStoreWebhookMap = hasActiveWebhookColumn
       ? new Map<string, string[]>()
       : await loadStoreWebhookMappingsFromLogs(storeIds);
@@ -700,7 +787,7 @@ export async function GET(request: NextRequest) {
         category: store.category,
         status: store.status,
         priceCents: store.price_cents ?? 0,
-        orderCount: 0,
+        orderCount: countsByStoreId.get(store.id) ?? 0,
         hasActiveSubscription,
         hasActiveAutomationWebhook,
         plan,
