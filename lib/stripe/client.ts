@@ -89,9 +89,6 @@ const getPriceIdForMode = (plan: BillingPlan, interval: BillingInterval, mode: S
   return null;
 };
 
-export const stripe = new Stripe(serverEnv.STRIPE_SECRET_KEY);
-stripeClientCache.set(ACTIVE_STRIPE_MODE, stripe);
-
 export const getStripeClientForMode = (mode: StripeMode = ACTIVE_STRIPE_MODE) => {
   const cached = stripeClientCache.get(mode);
   if (cached) {

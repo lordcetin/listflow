@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
 import { serverEnv } from "@/lib/env/server";
-import { getPlanCentsByInterval, stripe } from "@/lib/stripe/client";
+import { getPlanCentsByInterval, getStripeClientForMode } from "@/lib/stripe/client";
 import { syncOneTimeCheckoutPayment } from "@/lib/stripe/checkout-payment-sync";
 import { dispatchN8nTrigger } from "@/lib/n8n/client";
 import { createActivationIdempotencyKey } from "@/lib/scheduler/idempotency";
@@ -10,6 +10,8 @@ import { supabaseAdmin } from "@/lib/supabase/admin";
 import { isUuid } from "@/lib/utils/uuid";
 
 export const runtime = "nodejs";
+
+const getStripe = () => getStripeClientForMode();
 
 const toIsoDate = (value: number | null | undefined) => {
   if (!value) {
@@ -39,7 +41,7 @@ const resolveCustomerEmail = async (
   }
 
   try {
-    const fetched = await stripe.customers.retrieve(customer);
+    const fetched = await getStripe().customers.retrieve(customer);
     if ("deleted" in fetched && fetched.deleted) {
       return null;
     }
@@ -598,7 +600,7 @@ export async function POST(request: NextRequest) {
   let event: Stripe.Event;
 
   try {
-    event = stripe.webhooks.constructEvent(payload, signature, serverEnv.STRIPE_WEBHOOK_SECRET);
+    event = getStripe().webhooks.constructEvent(payload, signature, serverEnv.STRIPE_WEBHOOK_SECRET);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Invalid signature";
     return NextResponse.json({ error: message }, { status: 400 });
@@ -620,7 +622,7 @@ export async function POST(request: NextRequest) {
         const session = event.data.object as Stripe.Checkout.Session;
 
         if (session.mode === "subscription" && typeof session.subscription === "string") {
-          const subscription = await stripe.subscriptions.retrieve(session.subscription);
+          const subscription = await getStripe().subscriptions.retrieve(session.subscription);
           const subscriberEmail =
             session.customer_details?.email ??
             session.customer_email ??

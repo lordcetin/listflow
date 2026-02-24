@@ -2,13 +2,15 @@ import { NextRequest, NextResponse } from "next/server";
 import { ACCESS_TOKEN_COOKIE } from "@/lib/auth/session";
 import { getUserFromAccessToken } from "@/lib/auth/admin";
 import type Stripe from "stripe";
-import { getPlanCentsByInterval, stripe } from "@/lib/stripe/client";
+import { getPlanCentsByInterval, getStripeClientForMode } from "@/lib/stripe/client";
 import { syncOneTimeCheckoutPayment } from "@/lib/stripe/checkout-payment-sync";
 import { findFirstProfileUserIdByEmail, syncProfileSubscriptionState } from "@/lib/subscription/profile-sync";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { isUuid } from "@/lib/utils/uuid";
 
 export const runtime = "nodejs";
+
+const getStripe = () => getStripeClientForMode();
 
 const toIsoDate = (value: number | null | undefined) => {
   if (!value) {
@@ -38,7 +40,7 @@ const resolveCustomerEmail = async (
   }
 
   try {
-    const fetched = await stripe.customers.retrieve(customer);
+    const fetched = await getStripe().customers.retrieve(customer);
     if ("deleted" in fetched && fetched.deleted) {
       return null;
     }
@@ -169,7 +171,7 @@ export async function POST(request: NextRequest) {
     const accessToken = request.cookies.get(ACCESS_TOKEN_COOKIE)?.value;
     const user = accessToken ? await getUserFromAccessToken(accessToken) : null;
 
-    const session = await stripe.checkout.sessions.retrieve(body.sessionId, {
+    const session = await getStripe().checkout.sessions.retrieve(body.sessionId, {
       expand: ["subscription"],
     });
 

@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { serverEnv } from "@/lib/env/server";
 import { getUserFromAccessToken } from "@/lib/auth/admin";
 import { ACCESS_TOKEN_COOKIE } from "@/lib/auth/session";
-import { type BillingInterval, type BillingPlan, stripe } from "@/lib/stripe/client";
+import { getStripeClientForMode, type BillingInterval, type BillingPlan } from "@/lib/stripe/client";
 import { resolveCheckoutPriceId } from "@/lib/stripe/plans";
 
 export const runtime = "nodejs";
@@ -28,6 +28,7 @@ const isSubscriptionPayload = (payload: SubscriptionPayload | OneTimePayload): p
 
 export async function POST(request: NextRequest) {
   try {
+    const stripe = getStripeClientForMode();
     const body = (await request.json()) as SubscriptionPayload | OneTimePayload;
 
     const accessToken = request.cookies.get(ACCESS_TOKEN_COOKIE)?.value;
