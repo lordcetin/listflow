@@ -45,12 +45,17 @@ Listflow automation scheduler endpoint:
 ### Required env
 
 - `CRON_SECRET` (required)
+- `APP_URL=https://listflow.pro`
+- `CRON_SCHEDULER_BASE_URL=https://listflow.pro`
+- `CRON_JOB_ORG_API_KEY=<cron-job.org api key>` (opsiyonel, `CRON_SECRET` fallback'i var)
 
-### cron-job.org setup
+### Automatic cron-job.org sync
 
-1. Create a new job with URL: `https://<your-domain>/api/scheduler/tick`
-2. Method: `POST`
-3. Add header: `Authorization: Bearer <CRON_SECRET>`
-4. Set schedule: every 1 minute (`* * * * *`)
+Webhook Console üzerinden webhook create/update/delete işlemlerinde sistem cron-job.org job kaydını otomatik create/update/delete eder.
+
+- Target URL: `https://listflow.pro/api/scheduler/tick`
+- Method: `POST`
+- Header: `Authorization: Bearer <CRON_SECRET>`
+- Schedule: every 1 minute (`* * * * *`)
 
 This project intentionally does not use `vercel.json` cron definitions to avoid dual-trigger collisions. If you need Vercel cron as fallback later, add it manually.
