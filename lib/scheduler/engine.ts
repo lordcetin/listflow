@@ -297,7 +297,7 @@ const loadStores = async (storeIds: string[]) => {
 
 const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
   if (!storeIds.length) {
-    return new Map<string, string>();
+    return new Map<string, string[]>();
   }
 
   const { data, error } = await supabaseAdmin
@@ -308,11 +308,11 @@ const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
     .limit(5000);
 
   if (error) {
-    return new Map<string, string>();
+    return new Map<string, string[]>();
   }
 
   const allowedStoreIds = new Set(storeIds);
-  const mapping = new Map<string, string>();
+  const mapping = new Map<string, string[]>();
 
   for (const row of (data ?? []) as Array<{ request_body: unknown }>) {
     const body =
@@ -323,25 +323,26 @@ const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
     const storeId = typeof body?.store_id === "string" ? body.store_id : null;
     const webhookConfigId = typeof body?.webhook_config_id === "string" ? body.webhook_config_id : null;
 
-    if (!storeId || !webhookConfigId || !allowedStoreIds.has(storeId) || mapping.has(storeId)) {
+    if (!storeId || !webhookConfigId || !allowedStoreIds.has(storeId)) {
       continue;
     }
 
-    mapping.set(storeId, webhookConfigId);
+    const current = mapping.get(storeId) ?? [];
+    if (!current.includes(webhookConfigId)) {
+      current.push(webhookConfigId);
+    }
+    mapping.set(storeId, current);
   }
 
   return mapping;
 };
 
-const loadWebhookConfigs = async (webhookConfigIds: string[]) => {
-  if (!webhookConfigIds.length) {
-    return [] as WebhookConfigRow[];
-  }
-
+const loadWebhookConfigs = async () => {
   const withScope = await supabaseAdmin
     .from("webhook_configs")
     .select("id, target_url, method, headers, enabled, scope")
-    .in("id", webhookConfigIds);
+    .order("created_at", { ascending: false })
+    .limit(1000);
 
   if (!withScope.error) {
     return (withScope.data ?? []) as WebhookConfigRow[];
@@ -354,7 +355,8 @@ const loadWebhookConfigs = async (webhookConfigIds: string[]) => {
   const fallback = await supabaseAdmin
     .from("webhook_configs")
     .select("id, target_url, method, headers, enabled")
-    .in("id", webhookConfigIds);
+    .order("created_at", { ascending: false })
+    .limit(1000);
 
   if (fallback.error) {
     throw fallback.error;
@@ -803,6 +805,22 @@ const findScheduledSlotJob = (jobs: SchedulerJobRow[], storeId: string, slotKey:
   return null;
 };
 
+const isActiveAutomationWebhook = (webhookConfig: WebhookConfigRow | null | undefined) => {
+  if (!webhookConfig) {
+    return false;
+  }
+
+  if (webhookConfig.enabled === false) {
+    return false;
+  }
+
+  if (webhookConfig.scope === "generic") {
+    return false;
+  }
+
+  return true;
+};
+
 export const runSchedulerTick = async (): Promise<SchedulerSummary> => {
   const subscriptions = await loadActiveSubscriptions();
   const nowMs = Date.now();
@@ -830,23 +848,41 @@ export const runSchedulerTick = async (): Promise<SchedulerSummary> => {
 
   const fallbackStoreWebhookMap = await loadStoreWebhookMappingsFromLogs(storeIds);
   const storesById = new Map<string, StoreRow>(storeRows.map((store) => [store.id, store]));
-  const activeWebhookByStoreId = new Map<string, string | null>();
-
-  for (const storeId of storeIds) {
-    const mappedId = storesById.get(storeId)?.active_webhook_config_id ?? fallbackStoreWebhookMap.get(storeId) ?? null;
-    activeWebhookByStoreId.set(storeId, mappedId);
-  }
-
-  const webhookConfigIds = Array.from(
-    new Set(
-      Array.from(activeWebhookByStoreId.values()).filter((value): value is string => Boolean(value))
-    )
-  );
-
-  const webhookConfigs = await loadWebhookConfigs(webhookConfigIds);
+  const webhookConfigs = await loadWebhookConfigs();
   const webhooksById = new Map<string, WebhookConfigRow>(
     webhookConfigs.map((config) => [config.id, config])
   );
+  const activeAutomationWebhookIds = webhookConfigs
+    .filter((config) => isActiveAutomationWebhook(config))
+    .map((config) => config.id);
+  const singletonActiveWebhookId = activeAutomationWebhookIds.length === 1 ? activeAutomationWebhookIds[0] : null;
+  const activeWebhookByStoreId = new Map<string, string | null>();
+
+  for (const storeId of storeIds) {
+    const explicitWebhookId = storesById.get(storeId)?.active_webhook_config_id ?? null;
+    const fallbackWebhookCandidates = fallbackStoreWebhookMap.get(storeId) ?? [];
+
+    let resolvedWebhookId: string | null = null;
+
+    if (explicitWebhookId && isActiveAutomationWebhook(webhooksById.get(explicitWebhookId))) {
+      resolvedWebhookId = explicitWebhookId;
+    }
+
+    if (!resolvedWebhookId) {
+      for (const candidateId of fallbackWebhookCandidates) {
+        if (isActiveAutomationWebhook(webhooksById.get(candidateId))) {
+          resolvedWebhookId = candidateId;
+          break;
+        }
+      }
+    }
+
+    if (!resolvedWebhookId && singletonActiveWebhookId) {
+      resolvedWebhookId = singletonActiveWebhookId;
+    }
+
+    activeWebhookByStoreId.set(storeId, resolvedWebhookId);
+  }
 
   const jobsBySubscriptionId = new Map<string, SchedulerJobRow[]>();
 
@@ -981,6 +1017,15 @@ export const runSchedulerTick = async (): Promise<SchedulerSummary> => {
         });
 
         schedulerJobId = slotJob.id;
+      } else if (slotJob && existingStatus === "skipped") {
+        await updateSchedulerJobWithFallback(slotJob.id, {
+          status: "processing",
+          runAt: nowIso,
+          errorMessage: null,
+        });
+
+        schedulerJobId = slotJob.id;
+        currentRetryCount = slotJob.retry_count ?? 0;
       } else {
         const createdJobResult = await insertSchedulerJobWithFallback({
           subscriptionId: subscription.id,

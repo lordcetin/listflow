@@ -445,7 +445,7 @@ const loadCategories = async () => {
 
 const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
   if (!storeIds.length) {
-    return new Map<string, string>();
+    return new Map<string, string[]>();
   }
 
   const { data, error } = await supabaseAdmin
@@ -456,11 +456,11 @@ const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
     .limit(5000);
 
   if (error) {
-    return new Map<string, string>();
+    return new Map<string, string[]>();
   }
 
   const allowedStoreIds = new Set(storeIds);
-  const mapping = new Map<string, string>();
+  const mapping = new Map<string, string[]>();
 
   for (const row of (data ?? []) as Array<{ request_body: unknown }>) {
     const body =
@@ -471,11 +471,15 @@ const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
     const storeId = typeof body?.store_id === "string" ? body.store_id : null;
     const webhookConfigId = typeof body?.webhook_config_id === "string" ? body.webhook_config_id : null;
 
-    if (!storeId || !webhookConfigId || !allowedStoreIds.has(storeId) || mapping.has(storeId)) {
+    if (!storeId || !webhookConfigId || !allowedStoreIds.has(storeId)) {
       continue;
     }
 
-    mapping.set(storeId, webhookConfigId);
+    const current = mapping.get(storeId) ?? [];
+    if (!current.includes(webhookConfigId)) {
+      current.push(webhookConfigId);
+    }
+    mapping.set(storeId, current);
   }
 
   return mapping;
@@ -697,7 +701,7 @@ export async function GET(request: NextRequest) {
     ]);
 
     const storeWebhookMappingFallback = hasActiveWebhookColumn
-      ? new Map<string, string>()
+      ? new Map<string, string[]>()
       : await loadStoreWebhookMappingsFromLogs(stores.map((store) => store.id));
 
     const userIds = Array.from(new Set(stores.map((store) => store.user_id)));
@@ -727,6 +731,8 @@ export async function GET(request: NextRequest) {
     const latestJobByStoreId = new Map<string, SchedulerJobRow>();
     const jobsByStoreId = new Map<string, SchedulerJobRow[]>();
     const webhookById = new Map<string, WebhookConfigRow>(webhooks.map((webhook) => [webhook.id, webhook]));
+    const activeWebhookIds = new Set(webhooks.map((webhook) => webhook.id));
+    const singletonActiveWebhookId = webhooks.length === 1 ? webhooks[0].id : null;
     const nowMs = Date.now();
 
     for (const subscription of subscriptions) {
@@ -765,6 +771,22 @@ export async function GET(request: NextRequest) {
       jobs.sort((a, b) => getJobTimestamp(b) - getJobTimestamp(a));
     }
 
+    const resolveStoreWebhookId = (store: StoreRow) => {
+      const explicitId = store.active_webhook_config_id;
+      if (explicitId && activeWebhookIds.has(explicitId)) {
+        return explicitId;
+      }
+
+      const fallbackCandidates = storeWebhookMappingFallback.get(store.id) ?? [];
+      for (const candidateId of fallbackCandidates) {
+        if (activeWebhookIds.has(candidateId)) {
+          return candidateId;
+        }
+      }
+
+      return singletonActiveWebhookId;
+    };
+
     const rows = stores.map((store) => {
       const profile = profileByUserId.get(store.user_id);
       const activeSubscription = subscriptionByStoreId.get(store.id) ?? null;
@@ -772,7 +794,7 @@ export async function GET(request: NextRequest) {
       const canSwitch = Boolean(activeSubscription);
       const lastJob = latestJobByStoreId.get(store.id) ?? null;
       const storeJobs = jobsByStoreId.get(store.id) ?? [];
-      const activeWebhookConfigId = store.active_webhook_config_id ?? storeWebhookMappingFallback.get(store.id) ?? null;
+      const activeWebhookConfigId = resolveStoreWebhookId(store);
       const activeWebhook = activeWebhookConfigId ? webhookById.get(activeWebhookConfigId) ?? null : null;
       const storeProduct = store.product_id ? productsById.get(store.product_id) : null;
       const hasStoreBoundProduct = Boolean(store.product_id);

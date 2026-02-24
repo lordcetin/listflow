@@ -393,7 +393,7 @@ const loadStores = async (userId: string) => {
 
 const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
   if (!storeIds.length) {
-    return new Map<string, string>();
+    return new Map<string, string[]>();
   }
 
   const { data, error } = await supabaseAdmin
@@ -404,11 +404,11 @@ const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
     .limit(5000);
 
   if (error) {
-    return new Map<string, string>();
+    return new Map<string, string[]>();
   }
 
   const allowedStoreIds = new Set(storeIds);
-  const mapping = new Map<string, string>();
+  const mapping = new Map<string, string[]>();
 
   for (const row of (data ?? []) as Array<{ request_body: unknown }>) {
     const body =
@@ -419,21 +419,21 @@ const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
     const storeId = typeof body?.store_id === "string" ? body.store_id : null;
     const webhookConfigId = typeof body?.webhook_config_id === "string" ? body.webhook_config_id : null;
 
-    if (!storeId || !webhookConfigId || !allowedStoreIds.has(storeId) || mapping.has(storeId)) {
+    if (!storeId || !webhookConfigId || !allowedStoreIds.has(storeId)) {
       continue;
     }
 
-    mapping.set(storeId, webhookConfigId);
+    const current = mapping.get(storeId) ?? [];
+    if (!current.includes(webhookConfigId)) {
+      current.push(webhookConfigId);
+    }
+    mapping.set(storeId, current);
   }
 
   return mapping;
 };
 
-const loadActiveAutomationWebhookIds = async (webhookIds: string[]) => {
-  if (!webhookIds.length) {
-    return new Set<string>();
-  }
-
+const loadActiveAutomationWebhookIds = async () => {
   const candidates = [
     "id, enabled, scope",
     "id, enabled",
@@ -445,8 +445,8 @@ const loadActiveAutomationWebhookIds = async (webhookIds: string[]) => {
     const query = supabaseAdmin
       .from("webhook_configs")
       .select(select)
-      .in("id", webhookIds)
-      .limit(webhookIds.length);
+      .order("created_at", { ascending: false })
+      .limit(2000);
 
     const { data, error } = await query;
 
@@ -546,17 +546,28 @@ export async function GET(request: NextRequest) {
 
     const storeIds = stores.map((store) => store.id);
     const fallbackStoreWebhookMap = hasActiveWebhookColumn
-      ? new Map<string, string>()
+      ? new Map<string, string[]>()
       : await loadStoreWebhookMappingsFromLogs(storeIds);
+    const activeAutomationWebhookIds = await loadActiveAutomationWebhookIds();
+    const singletonActiveWebhookId =
+      activeAutomationWebhookIds.size === 1 ? Array.from(activeAutomationWebhookIds)[0] : null;
 
-    const configuredWebhookIds = Array.from(
-      new Set(
-        stores
-          .map((store) => store.active_webhook_config_id ?? fallbackStoreWebhookMap.get(store.id) ?? null)
-          .filter((value): value is string => Boolean(value))
-      )
-    );
-    const activeAutomationWebhookIds = await loadActiveAutomationWebhookIds(configuredWebhookIds);
+    const resolveStoreWebhookId = (store: StoreRow) => {
+      const explicitId = store.active_webhook_config_id;
+
+      if (explicitId && activeAutomationWebhookIds.has(explicitId)) {
+        return explicitId;
+      }
+
+      const fallbackCandidates = fallbackStoreWebhookMap.get(store.id) ?? [];
+      for (const candidateId of fallbackCandidates) {
+        if (activeAutomationWebhookIds.has(candidateId)) {
+          return candidateId;
+        }
+      }
+
+      return singletonActiveWebhookId;
+    };
 
     const rows = stores.map((store) => {
       const matchedSubscriptions = subscriptions
@@ -577,8 +588,8 @@ export async function GET(request: NextRequest) {
       const intervalHours = plan ? getPlanWindowHours(plan) : null;
       const intervalMs = intervalHours ? intervalHours * 60 * 60 * 1000 : null;
       const nowMs = Date.now();
-      const configuredWebhookId = store.active_webhook_config_id ?? fallbackStoreWebhookMap.get(store.id) ?? null;
-      const hasActiveAutomationWebhook = configuredWebhookId ? activeAutomationWebhookIds.has(configuredWebhookId) : false;
+      const configuredWebhookId = resolveStoreWebhookId(store);
+      const hasActiveAutomationWebhook = Boolean(configuredWebhookId);
 
       const subscriptionJobs = primarySubscription
         ? schedulerJobs.filter((job) => job.subscription_id === primarySubscription.id)

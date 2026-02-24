@@ -25,6 +25,7 @@ type CronJobPayload = {
   title: string;
   saveResponses: boolean;
   url: string;
+  redirectSuccess: boolean;
   requestMethod: number;
   schedule: CronJobSchedule;
   extendedData: CronJobExtendedData;
@@ -83,6 +84,7 @@ const createSchedulerJobPayload = (): CronJobPayload => ({
   title: LISTFLOW_SCHEDULER_TITLE,
   saveResponses: true,
   url: schedulerTickUrl(),
+  redirectSuccess: true,
   requestMethod: POST_REQUEST_METHOD,
   schedule: createSchedule(),
   extendedData: {
@@ -374,4 +376,3 @@ export const syncSchedulerCronJobLifecycle = async (): Promise<SchedulerCronSync
     };
   }
 };
-
