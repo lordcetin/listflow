@@ -60,7 +60,7 @@ const Sidebar: React.FC<SidebarProps> = ({ mobileOpen = false, onClose }) => {
         />
       )}
       <div
-        className={`fixed inset-y-0 left-0 z-40 w-72 h-full flex flex-col p-6 sidebar-bg shrink-0 transform transition-transform duration-300 lg:relative lg:z-20 lg:translate-x-0 ${
+        className={`fixed inset-y-0 left-0 z-40 w-59 px-3 h-full flex flex-col sidebar-bg shrink-0 transform transition-transform duration-300 lg:relative lg:z-20 lg:translate-x-0 ${
           mobileOpen ? "translate-x-0" : "-translate-x-full"
         }`}
       >

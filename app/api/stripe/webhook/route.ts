@@ -9,10 +9,12 @@ import { createActivationIdempotencyKey } from "@/lib/scheduler/idempotency";
 import { findFirstProfileUserIdByEmail, syncProfileSubscriptionState } from "@/lib/subscription/profile-sync";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { isUuid } from "@/lib/utils/uuid";
+import { loadWebhookConfigProductMap } from "@/lib/webhooks/config-product-map";
 
 export const runtime = "nodejs";
 
 const getStripe = () => getStripeClientForMode();
+const ENABLE_STRIPE_ACTIVATION_AUTOMATION_DISPATCH = true;
 
 const toIsoDate = (value: number | null | undefined) => {
   if (!value) {
@@ -114,7 +116,7 @@ const isUniqueViolation = (error: { message?: string; code?: string } | null | u
 const loadStoreWebhookMappingFromLogs = async (storeId: string) => {
   const { data, error } = await supabaseAdmin
     .from("webhook_logs")
-    .select("request_body, created_at")
+    .select("request_body, request_url, created_at")
     .eq("request_method", "STORE_WEBHOOK_MAP")
     .order("created_at", { ascending: false })
     .limit(2000);
@@ -123,12 +125,19 @@ const loadStoreWebhookMappingFromLogs = async (storeId: string) => {
     return null;
   }
 
-  for (const row of (data ?? []) as Array<{ request_body: unknown }>) {
+  for (const row of (data ?? []) as Array<{ request_body: unknown; request_url?: string | null }>) {
     const body =
       typeof row.request_body === "object" && row.request_body !== null
         ? (row.request_body as Record<string, unknown>)
         : null;
     if (!body) continue;
+
+    const sourceUrl = typeof row.request_url === "string" ? row.request_url : null;
+    const idempotencyKey = typeof body.idempotency_key === "string" ? body.idempotency_key : null;
+    const isManualBinding = sourceUrl === "store-webhook-mapping" || (idempotencyKey?.startsWith("manual_switch:") ?? false);
+    const isActivationBinding =
+      sourceUrl === "store-webhook-mapping-activation" || (idempotencyKey?.startsWith("activation:") ?? false);
+    if (!isManualBinding && !isActivationBinding) continue;
 
     if (body.store_id !== storeId) continue;
     const webhookConfigId = typeof body.webhook_config_id === "string" ? body.webhook_config_id : null;
@@ -199,6 +208,218 @@ const loadAutomationWebhookConfig = async (id: string) => {
   }
 
   return { ...fallback.data, scope: "automation" };
+};
+
+const loadStoreActivationBinding = async (storeId: string) => {
+  const candidates = [
+    { select: "id,product_id,active_webhook_config_id", hasProduct: true, hasActiveWebhook: true },
+    { select: "id,product_id", hasProduct: true, hasActiveWebhook: false },
+    { select: "id,active_webhook_config_id", hasProduct: false, hasActiveWebhook: true },
+    { select: "id", hasProduct: false, hasActiveWebhook: false },
+  ] as const;
+
+  for (const candidate of candidates) {
+    const query = await supabaseAdmin
+      .from("stores")
+      .select(candidate.select)
+      .eq("id", storeId)
+      .maybeSingle<{ id: string; product_id?: string | null; active_webhook_config_id?: string | null }>();
+
+    if (!query.error) {
+      return {
+        productId: candidate.hasProduct ? query.data?.product_id ?? null : null,
+        activeWebhookConfigId: candidate.hasActiveWebhook ? query.data?.active_webhook_config_id ?? null : null,
+      };
+    }
+
+    if (!isMissingAnyColumnError(query.error, ["product_id", "active_webhook_config_id"])) {
+      throw new Error(query.error.message);
+    }
+  }
+
+  return {
+    productId: null,
+    activeWebhookConfigId: null,
+  };
+};
+
+const resolveWebhookByProduct = async (productId: string) => {
+  const withProductScope = await supabaseAdmin
+    .from("webhook_configs")
+    .select("id,target_url,method,headers,enabled,scope,product_id")
+    .eq("enabled", true)
+    .eq("scope", "automation")
+    .eq("product_id", productId)
+    .order("updated_at", { ascending: false })
+    .limit(1)
+    .maybeSingle<{
+      id: string;
+      target_url: string;
+      method: string | null;
+      headers: Record<string, unknown> | null;
+      enabled: boolean | null;
+      scope?: string | null;
+      product_id?: string | null;
+    }>();
+
+  if (!withProductScope.error) {
+    return withProductScope.data?.id ?? null;
+  }
+
+  if (!isMissingAnyColumnError(withProductScope.error, ["scope", "product_id"])) {
+    throw new Error(withProductScope.error.message);
+  }
+
+  const fallbackRows = await supabaseAdmin
+    .from("webhook_configs")
+    .select("id,target_url,method,headers,enabled,scope")
+    .eq("enabled", true)
+    .order("updated_at", { ascending: false })
+    .limit(5000);
+
+  if (fallbackRows.error) {
+    throw new Error(fallbackRows.error.message);
+  }
+
+  const candidates = (fallbackRows.data ?? []) as Array<{
+    id: string;
+    scope?: string | null;
+    target_url?: string | null;
+  }>;
+  const activeAutomationConfigIds = candidates
+    .filter((row) => Boolean(row.target_url) && (row.scope ?? "automation") !== "generic")
+    .map((row) => row.id);
+
+  if (!activeAutomationConfigIds.length) {
+    return null;
+  }
+
+  const productMap = await loadWebhookConfigProductMap(activeAutomationConfigIds);
+  for (const id of activeAutomationConfigIds) {
+    if (productMap.get(id) === productId) {
+      return id;
+    }
+  }
+
+  return null;
+};
+
+const persistActivationStoreWebhookMapping = async (args: {
+  storeId: string;
+  webhookConfigId: string;
+  idempotencyKey: string;
+  createdBy: string | null;
+}) => {
+  const payload = {
+    store_id: args.storeId,
+    webhook_config_id: args.webhookConfigId,
+    idempotency_key: args.idempotencyKey,
+  };
+
+  const candidates: Array<Record<string, unknown>> = [
+    {
+      request_url: "store-webhook-mapping-activation",
+      request_method: "STORE_WEBHOOK_MAP",
+      request_headers: {},
+      request_body: payload,
+      response_status: 200,
+      response_body: "mapping_saved",
+      duration_ms: 0,
+      created_by: args.createdBy,
+    },
+    {
+      request_url: "store-webhook-mapping-activation",
+      request_method: "STORE_WEBHOOK_MAP",
+      request_body: payload,
+    },
+  ];
+
+  for (const candidate of candidates) {
+    const { error } = await supabaseAdmin.from("webhook_logs").insert(candidate);
+    if (!error) return;
+    if (!isMissingAnyColumnError(error, ["request_headers", "response_status", "response_body", "duration_ms", "created_by"])) {
+      throw new Error(error.message);
+    }
+  }
+};
+
+const updateStoreActivationBinding = async (args: {
+  storeId: string;
+  webhookConfigId: string;
+  productId: string | null;
+  userId: string | null;
+}) => {
+  const nowIso = new Date().toISOString();
+  const payloads: Array<Record<string, unknown>> = [
+    {
+      active_webhook_config_id: args.webhookConfigId,
+      product_id: args.productId,
+      automation_updated_at: nowIso,
+      automation_updated_by: args.userId,
+    },
+    {
+      active_webhook_config_id: args.webhookConfigId,
+      product_id: args.productId,
+      automation_updated_at: nowIso,
+    },
+    {
+      active_webhook_config_id: args.webhookConfigId,
+      automation_updated_at: nowIso,
+    },
+    {
+      active_webhook_config_id: args.webhookConfigId,
+    },
+  ];
+
+  for (const payload of payloads) {
+    const attempt = await supabaseAdmin.from("stores").update(payload).eq("id", args.storeId);
+    if (!attempt.error) return;
+
+    if (!isMissingAnyColumnError(attempt.error, ["active_webhook_config_id", "product_id", "automation_updated_at", "automation_updated_by"])) {
+      throw new Error(attempt.error.message);
+    }
+  }
+};
+
+const ensureActivationWebhookBinding = async (args: {
+  storeId: string;
+  userId: string | null;
+  idempotencyKey: string;
+}) => {
+  const storeBinding = await loadStoreActivationBinding(args.storeId);
+  const explicitWebhookId = storeBinding.activeWebhookConfigId;
+
+  if (explicitWebhookId) {
+    const explicitWebhook = await loadAutomationWebhookConfig(explicitWebhookId);
+    if (explicitWebhook && explicitWebhook.enabled && explicitWebhook.scope !== "generic") {
+      return explicitWebhookId;
+    }
+  }
+
+  if (!storeBinding.productId) {
+    return loadStoreWebhookConfigId(args.storeId);
+  }
+
+  const webhookConfigId = await resolveWebhookByProduct(storeBinding.productId);
+  if (!webhookConfigId) {
+    return loadStoreWebhookConfigId(args.storeId);
+  }
+
+  await updateStoreActivationBinding({
+    storeId: args.storeId,
+    webhookConfigId,
+    productId: storeBinding.productId,
+    userId: args.userId,
+  });
+
+  await persistActivationStoreWebhookMapping({
+    storeId: args.storeId,
+    webhookConfigId,
+    idempotencyKey: args.idempotencyKey,
+    createdBy: args.userId,
+  });
+
+  return webhookConfigId;
 };
 
 const insertSchedulerActivationJobWithFallback = async (args: {
@@ -353,7 +574,11 @@ const triggerActivationAutomation = async (args: {
     currentPeriodEndIso
   );
 
-  const activeWebhookConfigId = await loadStoreWebhookConfigId(args.storeId);
+  const activeWebhookConfigId = await ensureActivationWebhookBinding({
+    storeId: args.storeId,
+    userId: args.userId,
+    idempotencyKey,
+  });
 
   if (!activeWebhookConfigId) {
     await insertSchedulerActivationJobWithFallback({
@@ -491,7 +716,10 @@ const upsertSubscriptionFromStripe = async (
   subscription: Stripe.Subscription,
   metadata?: Stripe.Metadata | null,
   customerId?: string | Stripe.Customer | Stripe.DeletedCustomer | null,
-  subscriberEmail?: string | null
+  subscriberEmail?: string | null,
+  options?: {
+    triggerActivationDispatch?: boolean;
+  }
 ) => {
   const plan = (metadata?.plan as string | undefined) ?? "standard";
   const billingInterval = (metadata?.billingInterval as string | undefined) === "year" ? "year" : "month";
@@ -566,7 +794,11 @@ const upsertSubscriptionFromStripe = async (
 
     throwSupabaseError("Failed to update store after subscription sync", storeUpdate.error);
 
-    if (subscription.status === "active" || subscription.status === "trialing") {
+    if (
+      ENABLE_STRIPE_ACTIVATION_AUTOMATION_DISPATCH &&
+      options?.triggerActivationDispatch === true &&
+      (subscription.status === "active" || subscription.status === "trialing")
+    ) {
       try {
         await triggerActivationAutomation({
           storeId,
@@ -618,11 +850,14 @@ export async function POST(request: NextRequest) {
   }
 
   try {
+    let shouldSyncCronLifecycle = false;
+
     switch (event.type) {
       case "checkout.session.completed": {
         const session = event.data.object as Stripe.Checkout.Session;
 
         if (session.mode === "subscription" && typeof session.subscription === "string") {
+          shouldSyncCronLifecycle = true;
           const subscription = await getStripe().subscriptions.retrieve(session.subscription);
           const subscriberEmail =
             session.customer_details?.email ??
@@ -632,7 +867,9 @@ export async function POST(request: NextRequest) {
             ...(subscription.metadata ?? {}),
             ...(session.metadata ?? {}),
           };
-          await upsertSubscriptionFromStripe(subscription, mergedMetadata, session.customer, subscriberEmail);
+          await upsertSubscriptionFromStripe(subscription, mergedMetadata, session.customer, subscriberEmail, {
+            triggerActivationDispatch: true,
+          });
         }
 
         if (session.mode === "payment") {
@@ -655,14 +892,26 @@ export async function POST(request: NextRequest) {
         }
         break;
       }
-      case "customer.subscription.updated":
       case "customer.subscription.created": {
+        shouldSyncCronLifecycle = true;
         const subscription = event.data.object as Stripe.Subscription;
         const subscriberEmail = await resolveCustomerEmail(subscription.customer);
-        await upsertSubscriptionFromStripe(subscription, subscription.metadata, subscription.customer, subscriberEmail);
+        await upsertSubscriptionFromStripe(subscription, subscription.metadata, subscription.customer, subscriberEmail, {
+          triggerActivationDispatch: true,
+        });
+        break;
+      }
+      case "customer.subscription.updated": {
+        shouldSyncCronLifecycle = true;
+        const subscription = event.data.object as Stripe.Subscription;
+        const subscriberEmail = await resolveCustomerEmail(subscription.customer);
+        await upsertSubscriptionFromStripe(subscription, subscription.metadata, subscription.customer, subscriberEmail, {
+          triggerActivationDispatch: false,
+        });
         break;
       }
       case "customer.subscription.deleted": {
+        shouldSyncCronLifecycle = true;
         const subscription = event.data.object as Stripe.Subscription;
         const existingSubscription = await supabaseAdmin
           .from("subscriptions")
@@ -738,10 +987,12 @@ export async function POST(request: NextRequest) {
     }
 
     let cronSyncError: string | null = null;
-    try {
-      await syncSchedulerCronJobLifecycle();
-    } catch (error) {
-      cronSyncError = error instanceof Error ? error.message : "Cron sync failed";
+    if (shouldSyncCronLifecycle) {
+      try {
+        await syncSchedulerCronJobLifecycle();
+      } catch (error) {
+        cronSyncError = error instanceof Error ? error.message : "Cron sync failed";
+      }
     }
 
     return NextResponse.json({ received: true, cronSyncError });

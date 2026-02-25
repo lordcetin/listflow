@@ -538,7 +538,7 @@ const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
 
   const { data, error } = await supabaseAdmin
     .from("webhook_logs")
-    .select("request_body, created_at")
+    .select("request_body, request_url, created_at")
     .eq("request_method", "STORE_WEBHOOK_MAP")
     .order("created_at", { ascending: false })
     .limit(5000);
@@ -550,11 +550,20 @@ const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
   const allowedStoreIds = new Set(storeIds);
   const mapping = new Map<string, StoreWebhookMappingSnapshot>();
 
-  for (const row of (data ?? []) as Array<{ request_body: unknown; created_at: string | null }>) {
+  for (const row of (data ?? []) as Array<{ request_body: unknown; request_url?: string | null; created_at: string | null }>) {
     const body =
       typeof row.request_body === "object" && row.request_body !== null
         ? (row.request_body as Record<string, unknown>)
         : null;
+
+    const sourceUrl = typeof row.request_url === "string" ? row.request_url : null;
+    const idempotencyKey = typeof body?.idempotency_key === "string" ? body.idempotency_key : null;
+    const isManualBinding = sourceUrl === "store-webhook-mapping" || (idempotencyKey?.startsWith("manual_switch:") ?? false);
+    const isActivationBinding =
+      sourceUrl === "store-webhook-mapping-activation" || (idempotencyKey?.startsWith("activation:") ?? false);
+    if (!isManualBinding && !isActivationBinding) {
+      continue;
+    }
 
     const storeId = typeof body?.store_id === "string" ? body.store_id : null;
     const webhookConfigId = typeof body?.webhook_config_id === "string" ? body.webhook_config_id : null;
@@ -708,9 +717,6 @@ export async function GET(request: NextRequest) {
     const fallbackStoreWebhookMap = await loadStoreWebhookMappingsFromLogs(storeIds);
     const directMode = isDirectAutomationMode();
     const activeAutomationWebhookIds = await loadActiveAutomationWebhookIds();
-    const singletonActiveWebhookId =
-      activeAutomationWebhookIds.size === 1 ? Array.from(activeAutomationWebhookIds)[0] : null;
-
     const resolveStoreWebhookId = (store: StoreRow) => {
       const explicitId = store.active_webhook_config_id;
 
@@ -725,7 +731,7 @@ export async function GET(request: NextRequest) {
         }
       }
 
-      return singletonActiveWebhookId;
+      return null;
     };
 
     const rows = stores.map((store) => {

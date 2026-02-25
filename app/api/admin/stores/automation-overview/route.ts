@@ -454,7 +454,7 @@ const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
 
   const { data, error } = await supabaseAdmin
     .from("webhook_logs")
-    .select("request_body, created_at")
+    .select("request_body, request_url, created_at")
     .eq("request_method", "STORE_WEBHOOK_MAP")
     .order("created_at", { ascending: false })
     .limit(5000);
@@ -466,11 +466,20 @@ const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
   const allowedStoreIds = new Set(storeIds);
   const mapping = new Map<string, string[]>();
 
-  for (const row of (data ?? []) as Array<{ request_body: unknown }>) {
+  for (const row of (data ?? []) as Array<{ request_body: unknown; request_url?: string | null }>) {
     const body =
       typeof row.request_body === "object" && row.request_body !== null
         ? (row.request_body as Record<string, unknown>)
         : null;
+
+    const sourceUrl = typeof row.request_url === "string" ? row.request_url : null;
+    const idempotencyKey = typeof body?.idempotency_key === "string" ? body.idempotency_key : null;
+    const isManualBinding = sourceUrl === "store-webhook-mapping" || (idempotencyKey?.startsWith("manual_switch:") ?? false);
+    const isActivationBinding =
+      sourceUrl === "store-webhook-mapping-activation" || (idempotencyKey?.startsWith("activation:") ?? false);
+    if (!isManualBinding && !isActivationBinding) {
+      continue;
+    }
 
     const storeId = typeof body?.store_id === "string" ? body.store_id : null;
     const webhookConfigId = typeof body?.webhook_config_id === "string" ? body.webhook_config_id : null;
@@ -773,7 +782,6 @@ export async function GET(request: NextRequest) {
     const jobsByStoreId = new Map<string, SchedulerJobRow[]>();
     const webhookById = new Map<string, WebhookConfigRow>(webhooks.map((webhook) => [webhook.id, webhook]));
     const activeWebhookIds = new Set(webhooks.map((webhook) => webhook.id));
-    const singletonActiveWebhookId = webhooks.length === 1 ? webhooks[0].id : null;
     const nowMs = Date.now();
 
     for (const subscription of subscriptions) {
@@ -825,7 +833,7 @@ export async function GET(request: NextRequest) {
         }
       }
 
-      return singletonActiveWebhookId;
+      return null;
     };
 
     const rows = stores.map((store) => {

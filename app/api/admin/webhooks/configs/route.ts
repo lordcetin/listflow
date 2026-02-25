@@ -6,6 +6,10 @@ import { persistWebhookConfigProductMap } from "@/lib/webhooks/config-product-ma
 import { syncSchedulerCronJobLifecycle } from "@/lib/cron-job-org/client";
 import { isUuid } from "@/lib/utils/uuid";
 
+const ENABLE_AUTOBIND_ON_WEBHOOK_CREATE = false;
+const ENABLE_DIRECT_BOOTSTRAP_ON_WEBHOOK_CREATE = false;
+const ENABLE_CRON_SYNC_ON_WEBHOOK_CREATE = false;
+
 type QueryError = { message?: string; code?: string | null };
 
 type ConfigPayload = {
@@ -687,21 +691,28 @@ export async function POST(request: NextRequest) {
             createdBy: admin.user.id,
           });
         }
-        const autoBind = data?.id && payload.enabled
+        const autoBind = ENABLE_AUTOBIND_ON_WEBHOOK_CREATE && data?.id && payload.enabled
           ? await autoBindWebhookToActiveStores({
               webhookConfigId: data.id,
               adminUserId: admin.user.id,
             })
           : { mappedCount: 0, mappedStoreIds: [], storeColumnUpdates: 0, logMappings: 0, skippedAlreadyMapped: 0, forceReboundCount: 0 };
         const directBootstrap =
-          data?.id && payload.enabled
+          ENABLE_DIRECT_BOOTSTRAP_ON_WEBHOOK_CREATE && data?.id && payload.enabled
             ? await triggerDirectBootstrapDispatch({
                 webhookConfigId: data.id,
                 storeIds: autoBind.mappedStoreIds,
                 createdBy: admin.user.id,
               })
             : { attempted: 0, success: 0, failed: 0 };
-        const cronSync = await syncSchedulerCronJobLifecycle();
+        const cronSync = ENABLE_CRON_SYNC_ON_WEBHOOK_CREATE
+          ? await syncSchedulerCronJobLifecycle()
+          : {
+              ok: true as const,
+              status: "noop" as const,
+              message:
+                "Webhook kaydedildi. Cron yalnız mağazaya bağlandığında veya ilgili mağazada abonelik ödeme aktivasyonu tamamlandığında başlatılır.",
+            };
         return NextResponse.json({ row: data, cronSync, autoBind, directBootstrap });
       }
 

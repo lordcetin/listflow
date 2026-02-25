@@ -170,7 +170,7 @@ const Dashboard: React.FC = () => {
             </div>
           </div>
         </header>
-        <main className="flex-1 overflow-hidden px-3 sm:px-5 lg:px-10 pt-4 sm:pt-6 lg:pt-8 pb-6 lg:pb-10">
+        <main className="flex-1 overflow-hidden">
           {renderContent()}
         </main>
       </div>

@@ -356,23 +356,56 @@ const buildFixedPlanHours = (intervalHours: number) => {
   return hours.length ? hours : [0];
 };
 
-const createAutomationSchedule = (plan: string | null | undefined) => {
+const resolveAnchorDate = (anchorIso: string | null | undefined, nowMs: number) => {
+  const parsed = anchorIso ? new Date(anchorIso) : null;
+  if (parsed && !Number.isNaN(parsed.getTime())) {
+    return parsed;
+  }
+
+  return new Date(nowMs);
+};
+
+const createAutomationSchedule = (plan: string | null | undefined, anchorIso: string | null | undefined, nowMs: number) => {
   const intervalHours = getPlanWindowHours(plan ?? "standard");
+  const anchorDate = resolveAnchorDate(anchorIso, nowMs);
+  const anchorHour = anchorDate.getUTCHours();
+  const anchorMinute = anchorDate.getUTCMinutes();
+  const hours = buildFixedPlanHours(intervalHours).map((hourOffset) => (anchorHour + hourOffset) % 24);
 
   return {
     timezone: "UTC",
     expiresAt: 0,
-    hours: buildFixedPlanHours(intervalHours),
+    hours: Array.from(new Set(hours)).sort((a, b) => a - b),
     mdays: [-1],
-    minutes: [0],
+    minutes: [anchorMinute],
     months: [-1],
     wdays: [-1],
   } satisfies CronJobSchedule;
 };
 
-const computeNextExecutionUnix = (args: { plan: string; nowMs: number }) => {
+const computeNextExecutionUnix = (args: { plan: string; nowMs: number; anchorIso: string | null | undefined }) => {
   const intervalMs = Math.max(1, getPlanWindowHours(args.plan)) * 60 * 60 * 1000;
-  const nextMs = Math.ceil(args.nowMs / intervalMs) * intervalMs;
+  const anchorDate = resolveAnchorDate(args.anchorIso, args.nowMs);
+  const anchorMs = Date.UTC(
+    anchorDate.getUTCFullYear(),
+    anchorDate.getUTCMonth(),
+    anchorDate.getUTCDate(),
+    anchorDate.getUTCHours(),
+    anchorDate.getUTCMinutes(),
+    0,
+    0
+  );
+
+  const nextMs = (() => {
+    if (anchorMs > args.nowMs) {
+      return anchorMs;
+    }
+
+    const elapsedMs = args.nowMs - anchorMs;
+    const elapsedSlots = Math.floor(elapsedMs / intervalMs) + 1;
+    return anchorMs + elapsedSlots * intervalMs;
+  })();
+
   return Math.floor(nextMs / 1000);
 };
 
@@ -515,7 +548,7 @@ const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
 
   const { data, error } = await supabaseAdmin
     .from("webhook_logs")
-    .select("request_body, created_at")
+    .select("request_body, request_url, created_at")
     .eq("request_method", "STORE_WEBHOOK_MAP")
     .order("created_at", { ascending: false })
     .limit(5000);
@@ -525,11 +558,20 @@ const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
   }
 
   const allowedStoreIds = new Set(storeIds);
-  for (const row of (data ?? []) as Array<{ request_body: unknown; created_at: string | null }>) {
+  for (const row of (data ?? []) as Array<{ request_body: unknown; request_url?: string | null; created_at: string | null }>) {
     const body =
       typeof row.request_body === "object" && row.request_body !== null
         ? (row.request_body as Record<string, unknown>)
         : null;
+
+    const sourceUrl = typeof row.request_url === "string" ? row.request_url : null;
+    const idempotencyKey = typeof body?.idempotency_key === "string" ? body.idempotency_key : null;
+    const isManualBinding = sourceUrl === "store-webhook-mapping" || (idempotencyKey?.startsWith("manual_switch:") ?? false);
+    const isActivationBinding =
+      sourceUrl === "store-webhook-mapping-activation" || (idempotencyKey?.startsWith("activation:") ?? false);
+    if (!isManualBinding && !isActivationBinding) {
+      continue;
+    }
 
     const storeId = typeof body?.store_id === "string" ? body.store_id : null;
     const webhookConfigId = typeof body?.webhook_config_id === "string" ? body.webhook_config_id : null;
@@ -676,7 +718,6 @@ const buildDesiredDirectJobs = async (nowMs: number) => {
   ]);
 
   const existingStoreIds = new Set(storeBindings.keys());
-  const singletonWebhookId = webhookConfigs.size === 1 ? Array.from(webhookConfigs.keys())[0] : null;
   const desiredJobs: DesiredDirectJob[] = [];
 
   for (const subscription of eligibleSubscriptions) {
@@ -695,8 +736,7 @@ const buildDesiredDirectJobs = async (nowMs: number) => {
 
     const webhookConfigId =
       (explicitWebhookId && webhookConfigs.has(explicitWebhookId) ? explicitWebhookId : null) ??
-      (mappedWebhookId && webhookConfigs.has(mappedWebhookId) ? mappedWebhookId : null) ??
-      singletonWebhookId;
+      (mappedWebhookId && webhookConfigs.has(mappedWebhookId) ? mappedWebhookId : null);
 
     if (!webhookConfigId) {
       continue;
@@ -710,8 +750,8 @@ const buildDesiredDirectJobs = async (nowMs: number) => {
     const anchorIso =
       binding?.automation_updated_at ??
       mapped?.mappedAt ??
-      subscription.updated_at ??
       subscription.created_at ??
+      subscription.updated_at ??
       new Date(nowMs).toISOString();
 
     const plan = (subscription.plan ?? "standard").toLowerCase();
@@ -731,7 +771,7 @@ const buildDesiredDirectJobs = async (nowMs: number) => {
       url: webhook.target_url,
       redirectSuccess: true,
       requestMethod: method === "GET" ? GET_REQUEST_METHOD : POST_REQUEST_METHOD,
-      schedule: createAutomationSchedule(plan),
+      schedule: createAutomationSchedule(plan, anchorIso, nowMs),
       extendedData: {
         headers: {
           ...(method === "POST" ? { "Content-Type": "application/json" } : {}),
@@ -849,6 +889,7 @@ const buildDesiredDirectCronRows = async (nowMs: number) => {
       const nextExecution = computeNextExecutionUnix({
         plan: job.plan,
         nowMs,
+        anchorIso: job.anchorIso,
       });
 
       return {

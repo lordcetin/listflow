@@ -4,6 +4,7 @@ export const trMessages = {
     retry: "Tekrar Dene",
     loading: "Yükleniyor",
     comingSoon: "yakında",
+    back: "Geri",
   },
   landing: {
     navFeatures: "Özellikler",

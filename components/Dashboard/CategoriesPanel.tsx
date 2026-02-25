@@ -455,7 +455,7 @@ const CategoriesPanel: React.FC = () => {
 
   return (
     <>
-      <div className="relative h-full min-h-0 p-2">
+      <div className="relative h-full min-h-0">
         {showMobileCategoryList ? (
           <div className="h-full rounded-[32px] glass-card-pro p-4 sm:p-6 overflow-y-auto custom-scrollbar">
             {renderCategoryRail()}

@@ -4,6 +4,7 @@ export const enMessages = {
     retry: "Try Again",
     loading: "Loading",
     comingSoon: "Coming soon.",
+    back: "Back",
   },
   landing: {
     navFeatures: "Features",
