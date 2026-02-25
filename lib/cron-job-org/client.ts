@@ -11,6 +11,7 @@ const POST_REQUEST_METHOD = 1;
 const DEFAULT_AUTOMATION_MODE = "direct";
 const PAGE_SIZE = 1000;
 const IN_FILTER_CHUNK_SIZE = 200;
+const DIRECT_JOBS_CACHE_TTL_MS = 90_000;
 
 type CronJobSchedule = {
   timezone: string;
@@ -124,6 +125,16 @@ type MappingSnapshot = {
   mappedAt: string | null;
 };
 
+type DesiredDirectJob = {
+  title: string;
+  payload: CronJobPayload;
+  subscriptionId: string;
+  storeId: string;
+  webhookConfigId: string;
+  plan: string;
+  anchorIso: string;
+};
+
 export type DirectAutomationCronJob = {
   jobId: number;
   enabled: boolean;
@@ -140,6 +151,16 @@ export type DirectAutomationCronJob = {
   webhookConfigId: string | null;
   plan: string | null;
 };
+
+let directAutomationCronJobsCache:
+  | {
+      rows: DirectAutomationCronJob[];
+      fetchedAt: number;
+      expiresAt: number;
+    }
+  | null = null;
+
+let directAutomationCronJobsInFlight: Promise<DirectAutomationCronJob[]> | null = null;
 
 const stripTrailingSlashes = (value: string) => value.replace(/\/+$/, "");
 
@@ -283,6 +304,15 @@ const parseCronJobApiError = async (response: Response) => {
   }
 };
 
+const isCronJobOrgRateLimitedError = (error: unknown) => {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const message = error.message.toLowerCase();
+  return message.includes("429") || message.includes("rate limit");
+};
+
 const callCronJobOrgApi = async <T>(args: {
   method: "GET" | "PUT" | "PATCH" | "DELETE";
   path: string;
@@ -343,6 +373,19 @@ const createAutomationSchedule = (plan: string | null | undefined, anchorIso: st
     months: [-1],
     wdays: [-1],
   } satisfies CronJobSchedule;
+};
+
+const computeNextExecutionUnix = (args: { anchorIso: string; plan: string; nowMs: number }) => {
+  const intervalMs = Math.max(1, getPlanWindowHours(args.plan)) * 60 * 60 * 1000;
+  const anchorMs = toTimestamp(args.anchorIso) ?? args.nowMs;
+
+  if (anchorMs > args.nowMs) {
+    return Math.floor(anchorMs / 1000);
+  }
+
+  const elapsed = args.nowMs - anchorMs;
+  const steps = Math.floor(elapsed / intervalMs) + 1;
+  return Math.floor((anchorMs + steps * intervalMs) / 1000);
 };
 
 const buildAutomationTitle = (args: {
@@ -626,99 +669,117 @@ const shouldUpdateManagedJob = (existing: CronJobListItem, desired: CronJobPaylo
   return urlChanged || methodChanged || enabledChanged || scheduleChanged;
 };
 
+const buildDesiredDirectJobs = async (nowMs: number) => {
+  const subscriptions = await loadActiveSubscriptions();
+  const eligibleSubscriptions = subscriptions.filter((row) => isSubscriptionEligible(row, nowMs));
+
+  const subscriptionStoreIds = Array.from(
+    new Set(
+      eligibleSubscriptions
+        .map((row) => getStoreIdFromSubscription(row))
+        .filter((storeId): storeId is string => Boolean(storeId))
+    )
+  );
+
+  const [storeBindings, mappingSnapshots, webhookConfigs] = await Promise.all([
+    loadStoreBindings(subscriptionStoreIds),
+    loadStoreWebhookMappingsFromLogs(subscriptionStoreIds),
+    loadActiveAutomationWebhookConfigs(),
+  ]);
+
+  const existingStoreIds = new Set(storeBindings.keys());
+  const singletonWebhookId = webhookConfigs.size === 1 ? Array.from(webhookConfigs.keys())[0] : null;
+  const desiredJobs: DesiredDirectJob[] = [];
+
+  for (const subscription of eligibleSubscriptions) {
+    const storeId = getStoreIdFromSubscription(subscription);
+    if (!storeId) {
+      continue;
+    }
+    if (!existingStoreIds.has(storeId)) {
+      continue;
+    }
+
+    const binding = storeBindings.get(storeId);
+    const mapped = mappingSnapshots.get(storeId);
+    const explicitWebhookId = binding?.active_webhook_config_id ?? null;
+    const mappedWebhookId = mapped?.webhookConfigId ?? null;
+
+    const webhookConfigId =
+      (explicitWebhookId && webhookConfigs.has(explicitWebhookId) ? explicitWebhookId : null) ??
+      (mappedWebhookId && webhookConfigs.has(mappedWebhookId) ? mappedWebhookId : null) ??
+      singletonWebhookId;
+
+    if (!webhookConfigId) {
+      continue;
+    }
+
+    const webhook = webhookConfigs.get(webhookConfigId);
+    if (!webhook) {
+      continue;
+    }
+
+    const anchorIso =
+      binding?.automation_updated_at ??
+      mapped?.mappedAt ??
+      subscription.updated_at ??
+      subscription.created_at ??
+      new Date(nowMs).toISOString();
+
+    const plan = (subscription.plan ?? "standard").toLowerCase();
+    const method = (webhook.method ?? "POST").toUpperCase() === "GET" ? "GET" : "POST";
+    const normalizedHeaders = normalizeHeaders(webhook.headers);
+    const title = buildAutomationTitle({
+      subscriptionId: subscription.id,
+      storeId,
+      webhookConfigId,
+      plan,
+    });
+
+    const payload: CronJobPayload = {
+      enabled: true,
+      title,
+      saveResponses: true,
+      url: webhook.target_url,
+      redirectSuccess: true,
+      requestMethod: method === "GET" ? GET_REQUEST_METHOD : POST_REQUEST_METHOD,
+      schedule: createAutomationSchedule(plan, anchorIso),
+      extendedData: {
+        headers: {
+          ...(method === "POST" ? { "Content-Type": "application/json" } : {}),
+          ...normalizedHeaders,
+        },
+        ...(method === "POST" ? { body: JSON.stringify({ client_id: storeId }) } : {}),
+      },
+    };
+
+    desiredJobs.push({
+      title,
+      payload,
+      subscriptionId: subscription.id,
+      storeId,
+      webhookConfigId,
+      plan,
+      anchorIso,
+    });
+  }
+
+  return desiredJobs;
+};
+
 const syncDirectAutomationCronJobs = async (apiKey: string): Promise<DirectAutomationSyncResult> => {
   try {
     const nowMs = Date.now();
-    const subscriptions = await loadActiveSubscriptions();
-    const eligibleSubscriptions = subscriptions.filter((row) => isSubscriptionEligible(row, nowMs));
-
-    const subscriptionStoreIds = Array.from(
-      new Set(
-        eligibleSubscriptions
-          .map((row) => getStoreIdFromSubscription(row))
-          .filter((storeId): storeId is string => Boolean(storeId))
-      )
-    );
-
-    const [storeBindings, mappingSnapshots, webhookConfigs, listResponse] = await Promise.all([
-      loadStoreBindings(subscriptionStoreIds),
-      loadStoreWebhookMappingsFromLogs(subscriptionStoreIds),
-      loadActiveAutomationWebhookConfigs(),
+    const [desiredJobs, listResponse] = await Promise.all([
+      buildDesiredDirectJobs(nowMs),
       callCronJobOrgApi<CronJobListResponse>({
         method: "GET",
         path: "/jobs",
         apiKey,
       }),
     ]);
-    const existingStoreIds = new Set(storeBindings.keys());
 
-    const singletonWebhookId = webhookConfigs.size === 1 ? Array.from(webhookConfigs.keys())[0] : null;
-    const desiredByTitle = new Map<string, CronJobPayload>();
-
-    for (const subscription of eligibleSubscriptions) {
-      const storeId = getStoreIdFromSubscription(subscription);
-      if (!storeId) {
-        continue;
-      }
-      if (!existingStoreIds.has(storeId)) {
-        continue;
-      }
-
-      const binding = storeBindings.get(storeId);
-      const mapped = mappingSnapshots.get(storeId);
-      const explicitWebhookId = binding?.active_webhook_config_id ?? null;
-      const mappedWebhookId = mapped?.webhookConfigId ?? null;
-
-      const webhookConfigId =
-        (explicitWebhookId && webhookConfigs.has(explicitWebhookId) ? explicitWebhookId : null) ??
-        (mappedWebhookId && webhookConfigs.has(mappedWebhookId) ? mappedWebhookId : null) ??
-        singletonWebhookId;
-
-      if (!webhookConfigId) {
-        continue;
-      }
-
-      const webhook = webhookConfigs.get(webhookConfigId);
-      if (!webhook) {
-        continue;
-      }
-
-      const anchorIso =
-        binding?.automation_updated_at ??
-        mapped?.mappedAt ??
-        subscription.updated_at ??
-        subscription.created_at ??
-        new Date(nowMs).toISOString();
-
-      const plan = (subscription.plan ?? "standard").toLowerCase();
-      const method = (webhook.method ?? "POST").toUpperCase() === "GET" ? "GET" : "POST";
-      const normalizedHeaders = normalizeHeaders(webhook.headers);
-      const title = buildAutomationTitle({
-        subscriptionId: subscription.id,
-        storeId,
-        webhookConfigId,
-        plan,
-      });
-
-      const payload: CronJobPayload = {
-        enabled: true,
-        title,
-        saveResponses: true,
-        url: webhook.target_url,
-        redirectSuccess: true,
-        requestMethod: method === "GET" ? GET_REQUEST_METHOD : POST_REQUEST_METHOD,
-        schedule: createAutomationSchedule(plan, anchorIso),
-        extendedData: {
-          headers: {
-            ...(method === "POST" ? { "Content-Type": "application/json" } : {}),
-            ...normalizedHeaders,
-          },
-          ...(method === "POST" ? { body: JSON.stringify({ client_id: storeId }) } : {}),
-        },
-      };
-
-      desiredByTitle.set(title, payload);
-    }
+    const desiredByTitle = new Map<string, CronJobPayload>(desiredJobs.map((job) => [job.title, job.payload]));
 
     const allJobs = (listResponse.jobs ?? []) as CronJobListItem[];
     const managedJobs = allJobs.filter((job) => isAutomationManagedTitle(job.title));
@@ -792,46 +853,127 @@ const syncDirectAutomationCronJobs = async (apiKey: string): Promise<DirectAutom
   }
 };
 
-export const loadDirectAutomationCronJobs = async () => {
+const buildDesiredDirectCronRows = async (nowMs: number) => {
+  const desiredJobs = await buildDesiredDirectJobs(nowMs);
+  const rows = desiredJobs
+    .sort((a, b) => a.title.localeCompare(b.title))
+    .map((job, index) => {
+      const nextExecution = computeNextExecutionUnix({
+        anchorIso: job.anchorIso,
+        plan: job.plan,
+        nowMs,
+      });
+
+      return {
+        jobId: -(index + 1),
+        enabled: true,
+        title: job.title,
+        url: job.payload.url,
+        requestMethod: job.payload.requestMethod,
+        lastStatus: 0,
+        lastDuration: null,
+        lastExecution: null,
+        nextExecution,
+        schedule: job.payload.schedule,
+        subscriptionId: job.subscriptionId,
+        storeId: job.storeId,
+        webhookConfigId: job.webhookConfigId,
+        plan: job.plan,
+      } satisfies DirectAutomationCronJob;
+    });
+
+  return rows;
+};
+
+export const loadDirectAutomationCronJobs = async (options?: { force?: boolean }) => {
   const apiKey = resolveCronApiKey();
   if (!apiKey) {
     throw new Error("Cron API key bulunamadı.");
   }
 
-  const listResponse = await callCronJobOrgApi<CronJobListResponse>({
-    method: "GET",
-    path: "/jobs",
-    apiKey,
-  });
+  const nowMs = Date.now();
+  const force = options?.force === true;
 
-  const rows = ((listResponse.jobs ?? []) as CronJobSummary[])
-    .filter((job) => isAutomationManagedTitle(job.title))
-    .map((job) => {
-      const parsed = parseAutomationTitle(job.title ?? null);
-      return {
-        jobId: job.jobId,
-        enabled: job.enabled !== false,
-        title: job.title ?? "",
-        url: job.url ?? "",
-        requestMethod: job.requestMethod ?? POST_REQUEST_METHOD,
-        lastStatus: job.lastStatus ?? null,
-        lastDuration: job.lastDuration ?? null,
-        lastExecution: job.lastExecution ?? null,
-        nextExecution: job.nextExecution ?? null,
-        schedule: job.schedule ?? null,
-        subscriptionId: parsed.subscriptionId,
-        storeId: parsed.storeId,
-        webhookConfigId: parsed.webhookConfigId,
-        plan: parsed.plan,
-      } satisfies DirectAutomationCronJob;
-    })
-    .sort((a, b) => {
-      const aNext = a.nextExecution ?? 0;
-      const bNext = b.nextExecution ?? 0;
-      return aNext - bNext;
-    });
+  if (!force && directAutomationCronJobsCache && directAutomationCronJobsCache.expiresAt > nowMs) {
+    return directAutomationCronJobsCache.rows;
+  }
 
-  return rows;
+  if (!force && directAutomationCronJobsInFlight) {
+    return directAutomationCronJobsInFlight;
+  }
+
+  const promise = (async () => {
+    try {
+      const listResponse = await callCronJobOrgApi<CronJobListResponse>({
+        method: "GET",
+        path: "/jobs",
+        apiKey,
+      });
+
+      const rows = ((listResponse.jobs ?? []) as CronJobSummary[])
+        .filter((job) => isAutomationManagedTitle(job.title))
+        .map((job) => {
+          const parsed = parseAutomationTitle(job.title ?? null);
+          return {
+            jobId: job.jobId,
+            enabled: job.enabled !== false,
+            title: job.title ?? "",
+            url: job.url ?? "",
+            requestMethod: job.requestMethod ?? POST_REQUEST_METHOD,
+            lastStatus: job.lastStatus ?? null,
+            lastDuration: job.lastDuration ?? null,
+            lastExecution: job.lastExecution ?? null,
+            nextExecution: job.nextExecution ?? null,
+            schedule: job.schedule ?? null,
+            subscriptionId: parsed.subscriptionId,
+            storeId: parsed.storeId,
+            webhookConfigId: parsed.webhookConfigId,
+            plan: parsed.plan,
+          } satisfies DirectAutomationCronJob;
+        })
+        .sort((a, b) => {
+          const aNext = a.nextExecution ?? 0;
+          const bNext = b.nextExecution ?? 0;
+          return aNext - bNext;
+        });
+
+      const fetchedAt = Date.now();
+      directAutomationCronJobsCache = {
+        rows,
+        fetchedAt,
+        expiresAt: fetchedAt + DIRECT_JOBS_CACHE_TTL_MS,
+      };
+
+      return rows;
+    } catch (error) {
+      if (isCronJobOrgRateLimitedError(error) && directAutomationCronJobsCache) {
+        return directAutomationCronJobsCache.rows;
+      }
+
+      if (isCronJobOrgRateLimitedError(error)) {
+        const fallbackRows = await buildDesiredDirectCronRows(Date.now());
+        const fetchedAt = Date.now();
+        directAutomationCronJobsCache = {
+          rows: fallbackRows,
+          fetchedAt,
+          expiresAt: fetchedAt + DIRECT_JOBS_CACHE_TTL_MS,
+        };
+        return fallbackRows;
+      }
+
+      throw error;
+    }
+  })();
+
+  directAutomationCronJobsInFlight = promise;
+
+  try {
+    return await promise;
+  } finally {
+    if (directAutomationCronJobsInFlight === promise) {
+      directAutomationCronJobsInFlight = null;
+    }
+  }
 };
 
 const findExistingSchedulerJobId = async (apiKey: string) => {

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ColumnDef } from "@tanstack/react-table";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -152,6 +152,8 @@ type CronTestListResponse = {
 
 type DirectCronListResponse = {
   rows?: DirectCronJobRow[];
+  rateLimited?: boolean;
+  message?: string;
   error?: string;
 };
 
@@ -191,6 +193,28 @@ const formatUnixDate = (value: number | null | undefined) => {
   }
 
   return date.toLocaleString("tr-TR");
+};
+
+const formatCountdown = (remainingMs: number | null | undefined) => {
+  if (remainingMs === null || remainingMs === undefined) {
+    return "-";
+  }
+
+  const totalSeconds = Math.max(0, Math.floor(remainingMs / 1000));
+  const days = Math.floor(totalSeconds / 86_400);
+  const hours = Math.floor((totalSeconds % 86_400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (days > 0) {
+    return `${days}g ${hours}sa ${minutes}dk ${seconds}sn`;
+  }
+
+  if (hours > 0) {
+    return `${hours}sa ${minutes}dk ${seconds}sn`;
+  }
+
+  return `${minutes}dk ${seconds}sn`;
 };
 
 const normalizeHeadersText = (value: string) => {
@@ -349,6 +373,8 @@ export default function AdminWebhookConsolePage() {
   const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  const directCronLastLoadedAtRef = useRef(0);
+  const [countdownNowMs, setCountdownNowMs] = useState(() => Date.now());
 
   const configMap = useMemo(() => new Map(configs.map((item) => [item.id, item])), [configs]);
   const productMap = useMemo(() => new Map(products.map((item) => [item.id, item])), [products]);
@@ -364,7 +390,8 @@ export default function AdminWebhookConsolePage() {
     setCronTestWebhooks(payload.rows ?? []);
   }, []);
 
-  const loadDirectCronJobs = useCallback(async () => {
+  const loadDirectCronJobs = useCallback(async (options?: { force?: boolean }) => {
+    const force = options?.force === true;
     const response = await fetch("/api/admin/webhooks/cron/direct-jobs", { cache: "no-store" });
     const payload = (await response.json().catch(() => ({}))) as DirectCronListResponse;
 
@@ -372,7 +399,20 @@ export default function AdminWebhookConsolePage() {
       throw new Error(payload.error || "Direct cron job listesi yüklenemedi.");
     }
 
-    setDirectCronJobs(payload.rows ?? []);
+    if (payload.rateLimited) {
+      if (payload.message) {
+        setInfo((prev) => prev ?? payload.message ?? null);
+      }
+
+      if (force && (payload.rows?.length ?? 0) === 0) {
+        return;
+      }
+    }
+
+    if (payload.rows) {
+      setDirectCronJobs(payload.rows);
+      directCronLastLoadedAtRef.current = Date.now();
+    }
   }, []);
 
   const loadOverview = useCallback(async (options?: { silent?: boolean }) => {
@@ -384,10 +424,11 @@ export default function AdminWebhookConsolePage() {
     setError(null);
 
     try {
+      const shouldLoadDirect = !silent || Date.now() - directCronLastLoadedAtRef.current > 180_000;
       const [overviewResponse] = await Promise.all([
         fetch("/api/admin/webhooks/overview", { cache: "no-store" }),
         loadCronTestWebhooks(),
-        loadDirectCronJobs(),
+        shouldLoadDirect ? loadDirectCronJobs({ force: !silent }) : Promise.resolve(),
       ]);
       const payload = (await overviewResponse.json()) as OverviewResponse;
 
@@ -422,6 +463,16 @@ export default function AdminWebhookConsolePage() {
       window.clearInterval(interval);
     };
   }, [loadOverview]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      setCountdownNowMs(Date.now());
+    }, 1000);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, []);
 
   const runExecute = async () => {
     setExecuteLoading(true);
@@ -759,89 +810,6 @@ export default function AdminWebhookConsolePage() {
     setEditOpen(false);
     setEditState(null);
   };
-
-  const configColumns = useMemo<ColumnDef<WebhookConfigRow>[]>(
-    () => [
-      {
-        accessorKey: "name",
-        header: "Webhook Başlığı",
-        cell: ({ row }) => {
-          const product = row.original.product_id ? productMap.get(row.original.product_id) : null;
-          return (
-            <div className="space-y-1">
-              <p className="font-black text-white">{product?.labelTr || row.original.name || "-"}</p>
-              <p className="text-xs text-slate-500">{row.original.product_id || "Alt ürün bağlı değil"}</p>
-            </div>
-          );
-        },
-      },
-      {
-        accessorKey: "target_url",
-        header: "Webhook URL",
-        cell: ({ row }) => <span className="text-xs break-all">{row.original.target_url}</span>,
-      },
-      {
-        accessorKey: "method",
-        header: "Method",
-      },
-      {
-        accessorKey: "enabled",
-        header: "Durum",
-        cell: ({ row }) => (
-          <Badge variant={row.original.enabled ? "success" : "secondary"}>{row.original.enabled ? "Aktif" : "Pasif"}</Badge>
-        ),
-      },
-      {
-        accessorKey: "updated_at",
-        header: "Güncellendi",
-        cell: ({ row }) => <span>{formatDate(row.original.updated_at || row.original.created_at)}</span>,
-      },
-      {
-        id: "actions",
-        header: "Aksiyon",
-        cell: ({ row }) => {
-          const item = row.original;
-          const loadingThis = actionLoadingId === item.id;
-          return (
-            <div className="flex items-center gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                className="cursor-pointer"
-                disabled={loadingThis}
-                onClick={() => openEditDialog(item)}
-              >
-                Düzenle
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                className="cursor-pointer"
-                disabled={loadingThis}
-                onClick={() =>
-                  void patchConfig(item.id, {
-                    enabled: !(item.enabled !== false),
-                  })
-                }
-              >
-                {item.enabled ? "Pasifleştir" : "Aktifleştir"}
-              </Button>
-              <Button
-                size="sm"
-                variant="destructive"
-                className="cursor-pointer"
-                disabled={loadingThis}
-                onClick={() => void deleteConfig(item.id)}
-              >
-                Sil
-              </Button>
-            </div>
-          );
-        },
-      },
-    ],
-    [actionLoadingId, deleteConfig, patchConfig, productMap]
-  );
 
   const logColumns = useMemo<ColumnDef<WebhookLogRow>[]>(
     () => [
@@ -1223,6 +1191,32 @@ export default function AdminWebhookConsolePage() {
     []
   );
 
+  const nextExecutionByWebhookConfigId = useMemo(() => {
+    const map = new Map<string, number>();
+
+    for (const row of directCronJobs) {
+      if (!row.enabled) {
+        continue;
+      }
+
+      if (!row.webhookConfigId) {
+        continue;
+      }
+
+      if (!row.nextExecution || row.nextExecution <= 0) {
+        continue;
+      }
+
+      const nextExecutionMs = row.nextExecution * 1000;
+      const current = map.get(row.webhookConfigId);
+      if (current === undefined || nextExecutionMs < current) {
+        map.set(row.webhookConfigId, nextExecutionMs);
+      }
+    }
+
+    return map;
+  }, [directCronJobs]);
+
   const storeNameById = useMemo(
     () =>
       new Map(
@@ -1321,6 +1315,112 @@ export default function AdminWebhookConsolePage() {
     [configMap, storeNameById]
   );
 
+  const configColumns = useMemo<ColumnDef<WebhookConfigRow>[]>(
+    () => [
+      {
+        accessorKey: "name",
+        header: "Webhook Başlığı",
+        cell: ({ row }) => {
+          const product = row.original.product_id ? productMap.get(row.original.product_id) : null;
+          return (
+            <div className="space-y-1">
+              <p className="font-black text-white">{product?.labelTr || row.original.name || "-"}</p>
+              <p className="text-xs text-slate-500">{row.original.product_id || "Alt ürün bağlı değil"}</p>
+            </div>
+          );
+        },
+      },
+      {
+        accessorKey: "target_url",
+        header: "Webhook URL",
+        cell: ({ row }) => <span className="text-xs break-all">{row.original.target_url}</span>,
+      },
+      {
+        accessorKey: "method",
+        header: "Method",
+      },
+      {
+        accessorKey: "enabled",
+        header: "Durum",
+        cell: ({ row }) => (
+          <Badge variant={row.original.enabled ? "success" : "secondary"}>{row.original.enabled ? "Aktif" : "Pasif"}</Badge>
+        ),
+      },
+      {
+        id: "next_upload_countdown",
+        header: "Sonraki Yükleme",
+        cell: ({ row }) => {
+          if (!row.original.enabled) {
+            return <Badge variant="secondary">Pasif</Badge>;
+          }
+
+          const nextExecutionMs = nextExecutionByWebhookConfigId.get(row.original.id) ?? null;
+          if (!nextExecutionMs) {
+            return <span className="text-xs text-slate-500">Planlı job yok</span>;
+          }
+
+          const remainingMs = nextExecutionMs - countdownNowMs;
+          return (
+            <div className="space-y-1">
+              <p className={`text-xs font-semibold ${remainingMs <= 0 ? "text-emerald-300" : "text-slate-100"}`}>
+                {formatCountdown(remainingMs)}
+              </p>
+              <p className="text-xs text-slate-500">{new Date(nextExecutionMs).toLocaleString("tr-TR")}</p>
+            </div>
+          );
+        },
+      },
+      {
+        accessorKey: "updated_at",
+        header: "Güncellendi",
+        cell: ({ row }) => <span>{formatDate(row.original.updated_at || row.original.created_at)}</span>,
+      },
+      {
+        id: "actions",
+        header: "Aksiyon",
+        cell: ({ row }) => {
+          const item = row.original;
+          const loadingThis = actionLoadingId === item.id;
+          return (
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                className="cursor-pointer"
+                disabled={loadingThis}
+                onClick={() => openEditDialog(item)}
+              >
+                Düzenle
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="cursor-pointer"
+                disabled={loadingThis}
+                onClick={() =>
+                  void patchConfig(item.id, {
+                    enabled: !(item.enabled !== false),
+                  })
+                }
+              >
+                {item.enabled ? "Pasifleştir" : "Aktifleştir"}
+              </Button>
+              <Button
+                size="sm"
+                variant="destructive"
+                className="cursor-pointer"
+                disabled={loadingThis}
+                onClick={() => void deleteConfig(item.id)}
+              >
+                Sil
+              </Button>
+            </div>
+          );
+        },
+      },
+    ],
+    [actionLoadingId, countdownNowMs, deleteConfig, nextExecutionByWebhookConfigId, patchConfig, productMap]
+  );
   return (
     <div className="space-y-6">
       <Card className="glass-card-pro rounded-[32px]">
