@@ -1,7 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAdminRequest, notFoundResponse } from "@/lib/auth/admin-request";
 import { getSubscriptionMonthIndex } from "@/lib/admin/automation";
-import { extractScheduledSlotDueIso, getPlanWindowHours } from "@/lib/scheduler/idempotency";
+import {
+  createScheduledSlotIdempotencyKey,
+  extractScheduledSlotDueIso,
+  getPlanWindowHours,
+} from "@/lib/scheduler/idempotency";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { isUuid } from "@/lib/utils/uuid";
 import { loadWebhookConfigProductMap } from "@/lib/webhooks/config-product-map";
@@ -614,6 +618,24 @@ const getLatestScheduledSlotDueMs = (jobs: SchedulerJobRow[]) => {
   return latest >= 0 ? latest : null;
 };
 
+const findScheduledSlotJob = (jobs: SchedulerJobRow[], storeId: string, slotKey: string) => {
+  for (const job of jobs) {
+    if (!isScheduledJob(job)) {
+      continue;
+    }
+
+    if ((resolveStoreIdForJob(job) ?? storeId) !== storeId) {
+      continue;
+    }
+
+    if (job.idempotency_key === slotKey) {
+      return job;
+    }
+  }
+
+  return null;
+};
+
 const getRetryDelayMinutes = (retryCount: number) => {
   if (retryCount <= 0) {
     return 1;
@@ -624,6 +646,8 @@ const getRetryDelayMinutes = (retryCount: number) => {
 };
 
 const computeNextTriggerAt = (args: {
+  subscriptionId: string | null | undefined;
+  storeId: string;
   plan: string | null | undefined;
   jobs: SchedulerJobRow[];
   nowMs: number;
@@ -641,38 +665,57 @@ const computeNextTriggerAt = (args: {
   const lastCadenceSuccessAt = getMostRecentCadenceSuccessAt(args.jobs);
   const latestScheduledSlotDueMs = getLatestScheduledSlotDueMs(args.jobs);
 
-  let nextTriggerAtMs: number;
+  let slotDueMs = (() => {
+    if (lastCadenceSuccessAt) {
+      return new Date(lastCadenceSuccessAt).getTime() + cadenceMs;
+    }
 
-  if (lastCadenceSuccessAt) {
-    nextTriggerAtMs = new Date(lastCadenceSuccessAt).getTime() + cadenceMs;
-  } else if (latestScheduledSlotDueMs !== null) {
-    nextTriggerAtMs = latestScheduledSlotDueMs;
-  } else {
-    nextTriggerAtMs = args.nowMs;
-  }
+    if (latestScheduledSlotDueMs !== null) {
+      return latestScheduledSlotDueMs;
+    }
 
-  const latestScheduledFailed = args.jobs
-    .filter((job) => isScheduledJob(job) && (job.status ?? "").toLowerCase() === "failed")
-    .sort((a, b) => getJobTimestamp(b) - getJobTimestamp(a))[0];
+    return args.nowMs;
+  })();
 
-  if (latestScheduledFailed) {
-    const retryCount = latestScheduledFailed.retry_count ?? 0;
+  if (args.subscriptionId) {
+    let slotDueIso = new Date(slotDueMs).toISOString();
+    let slotKey = createScheduledSlotIdempotencyKey({
+      subscriptionId: args.subscriptionId,
+      storeId: args.storeId,
+      plan: args.plan,
+      slotDueAtIso: slotDueIso,
+    });
+    let slotJob = findScheduledSlotJob(args.jobs, args.storeId, slotKey);
 
-    if (retryCount < 5) {
-      const retryDelayMs = getRetryDelayMinutes(retryCount) * 60 * 1000;
-      nextTriggerAtMs = getJobTimestamp(latestScheduledFailed) + retryDelayMs;
-    } else {
-      const slotDueIso = extractScheduledSlotDueIso(latestScheduledFailed.idempotency_key);
-      const slotDueMs = slotDueIso ? new Date(slotDueIso).getTime() : Number.NaN;
-      if (!Number.isNaN(slotDueMs) && slotDueMs >= nextTriggerAtMs) {
-        nextTriggerAtMs = slotDueMs + cadenceMs;
+    while (
+      slotJob &&
+      (slotJob.status ?? "").toLowerCase() === "failed" &&
+      (slotJob.retry_count ?? 0) >= 5
+    ) {
+      slotDueMs += cadenceMs;
+      slotDueIso = new Date(slotDueMs).toISOString();
+      slotKey = createScheduledSlotIdempotencyKey({
+        subscriptionId: args.subscriptionId,
+        storeId: args.storeId,
+        plan: args.plan,
+        slotDueAtIso: slotDueIso,
+      });
+      slotJob = findScheduledSlotJob(args.jobs, args.storeId, slotKey);
+    }
+
+    if (slotJob && (slotJob.status ?? "").toLowerCase() === "failed") {
+      const retryCount = slotJob.retry_count ?? 0;
+      if (retryCount < 5) {
+        slotDueMs = getJobTimestamp(slotJob) + getRetryDelayMinutes(retryCount) * 60 * 1000;
+      } else {
+        slotDueMs += cadenceMs;
       }
     }
   }
 
   return {
     cadenceHours,
-    nextTriggerAt: new Date(nextTriggerAtMs).toISOString(),
+    nextTriggerAt: new Date(slotDueMs).toISOString(),
     lastCadenceSuccessAt,
   };
 };
@@ -685,7 +728,7 @@ export async function GET(request: NextRequest) {
 
   try {
     const [
-      { rows: stores, hasActiveWebhookColumn },
+      { rows: stores },
       subscriptions,
       webhooks,
       schedulerJobs,
@@ -700,9 +743,7 @@ export async function GET(request: NextRequest) {
       loadCategories(),
     ]);
 
-    const storeWebhookMappingFallback = hasActiveWebhookColumn
-      ? new Map<string, string[]>()
-      : await loadStoreWebhookMappingsFromLogs(stores.map((store) => store.id));
+    const storeWebhookMappingFallback = await loadStoreWebhookMappingsFromLogs(stores.map((store) => store.id));
 
     const userIds = Array.from(new Set(stores.map((store) => store.user_id)));
     const profiles = await loadProfiles(userIds);
@@ -808,6 +849,8 @@ export async function GET(request: NextRequest) {
         : webhooks;
       const eligibleWebhookConfigIds = eligibleWebhooks.map((webhook) => webhook.id);
       const scheduleState = computeNextTriggerAt({
+        subscriptionId: activeSubscription?.id,
+        storeId: store.id,
         plan: activeSubscription?.plan,
         jobs: storeJobs,
         nowMs,

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAdminRequest, notFoundResponse } from "@/lib/auth/admin-request";
 import { getSubscriptionMonthIndex } from "@/lib/admin/automation";
+import { syncSchedulerCronJobLifecycle } from "@/lib/cron-job-org/client";
 import { dispatchN8nTrigger } from "@/lib/n8n/client";
 import { createManualSwitchIdempotencyKey } from "@/lib/scheduler/idempotency";
 import { supabaseAdmin } from "@/lib/supabase/admin";
@@ -575,6 +576,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       createdBy: admin.user.id,
       idempotencyKey,
     });
+    const cronSync = await syncSchedulerCronJobLifecycle();
 
     const schedulerJobInsert = await insertSchedulerJobWithFallback({
       subscriptionId: activeSubscription.id,
@@ -637,6 +639,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         success: dispatchResult.ok,
         idempotencyKey,
         storeId: store.id,
+        cronSync,
         transitionId: transitionId ?? null,
         schedulerJobId,
         monthIndex,

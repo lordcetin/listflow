@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
+import { syncSchedulerCronJobLifecycle } from "@/lib/cron-job-org/client";
 import { serverEnv } from "@/lib/env/server";
 import { getPlanCentsByInterval, getStripeClientForMode } from "@/lib/stripe/client";
 import { syncOneTimeCheckoutPayment } from "@/lib/stripe/checkout-payment-sync";
@@ -736,7 +737,14 @@ export async function POST(request: NextRequest) {
         break;
     }
 
-    return NextResponse.json({ received: true });
+    let cronSyncError: string | null = null;
+    try {
+      await syncSchedulerCronJobLifecycle();
+    } catch (error) {
+      cronSyncError = error instanceof Error ? error.message : "Cron sync failed";
+    }
+
+    return NextResponse.json({ received: true, cronSyncError });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Webhook handler error";
     return NextResponse.json({ error: message }, { status: 500 });

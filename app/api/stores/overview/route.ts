@@ -1,7 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getUserFromAccessToken } from "@/lib/auth/admin";
 import { ACCESS_TOKEN_COOKIE } from "@/lib/auth/session";
-import { extractScheduledSlotDueIso, getPlanWindowHours } from "@/lib/scheduler/idempotency";
+import {
+  createScheduledSlotIdempotencyKey,
+  extractScheduledSlotDueIso,
+  getPlanWindowHours,
+} from "@/lib/scheduler/idempotency";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { isUuid } from "@/lib/utils/uuid";
 
@@ -18,6 +22,11 @@ type StoreRow = {
   active_webhook_config_id?: string | null;
   automation_updated_at?: string | null;
   created_at: string | null;
+};
+
+type StoreWebhookMappingSnapshot = {
+  webhookConfigIds: string[];
+  lastMappedAt: string | null;
 };
 
 type SubscriptionRow = {
@@ -69,6 +78,9 @@ const isRecoverableColumnError = (error: { message?: string } | null | undefined
   return columns.some((column) => isMissingColumnError(error, column));
 };
 
+const isDirectAutomationMode = () =>
+  (process.env.AUTOMATION_DISPATCH_MODE?.trim().toLowerCase() || "direct") === "direct";
+
 const toValidDate = (value: string | null | undefined) => {
   if (!value) {
     return null;
@@ -76,6 +88,15 @@ const toValidDate = (value: string | null | undefined) => {
 
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+
+const toTimestamp = (value: string | null | undefined) => {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = new Date(value).getTime();
+  return Number.isNaN(parsed) ? null : parsed;
 };
 
 const isActiveSubscription = (row: SubscriptionRow) => {
@@ -224,6 +245,24 @@ const getLatestScheduledSlotDueMs = (jobs: SchedulerJobRow[]) => {
   return best >= 0 ? best : null;
 };
 
+const findScheduledSlotJob = (jobs: SchedulerJobRow[], storeId: string, slotKey: string) => {
+  for (const job of jobs) {
+    if (!isScheduledJob(job)) {
+      continue;
+    }
+
+    if ((resolveStoreIdForJob(job) ?? storeId) !== storeId) {
+      continue;
+    }
+
+    if (job.idempotency_key === slotKey) {
+      return job;
+    }
+  }
+
+  return null;
+};
+
 const getRetryDelayMinutes = (retryCount: number) => {
   if (retryCount <= 0) {
     return 1;
@@ -231,6 +270,31 @@ const getRetryDelayMinutes = (retryCount: number) => {
 
   const retrySchedule = [1, 2, 4, 8, 16] as const;
   return retrySchedule[Math.min(retryCount - 1, retrySchedule.length - 1)];
+};
+
+const toIsoOrNull = (value: string | null | undefined) => {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+
+  return parsed.toISOString();
+};
+
+const computeRollingNextAtMs = (anchorIso: string | null | undefined, intervalMs: number, nowMs: number) => {
+  const anchorMs = toTimestamp(anchorIso) ?? nowMs;
+  const firstDueMs = anchorMs + intervalMs;
+  if (firstDueMs > nowMs) {
+    return firstDueMs;
+  }
+
+  const elapsedMs = nowMs - firstDueMs;
+  const slotsElapsed = Math.floor(elapsedMs / intervalMs) + 1;
+  return firstDueMs + slotsElapsed * intervalMs;
 };
 
 const getAccessToken = (request: NextRequest) => request.cookies.get(ACCESS_TOKEN_COOKIE)?.value ?? null;
@@ -469,7 +533,7 @@ const loadPaidOrderCounts = async (args: { userId: string; storeIds: string[] })
 
 const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
   if (!storeIds.length) {
-    return new Map<string, string[]>();
+    return new Map<string, StoreWebhookMappingSnapshot>();
   }
 
   const { data, error } = await supabaseAdmin
@@ -480,13 +544,13 @@ const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
     .limit(5000);
 
   if (error) {
-    return new Map<string, string[]>();
+    return new Map<string, StoreWebhookMappingSnapshot>();
   }
 
   const allowedStoreIds = new Set(storeIds);
-  const mapping = new Map<string, string[]>();
+  const mapping = new Map<string, StoreWebhookMappingSnapshot>();
 
-  for (const row of (data ?? []) as Array<{ request_body: unknown }>) {
+  for (const row of (data ?? []) as Array<{ request_body: unknown; created_at: string | null }>) {
     const body =
       typeof row.request_body === "object" && row.request_body !== null
         ? (row.request_body as Record<string, unknown>)
@@ -499,10 +563,19 @@ const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
       continue;
     }
 
-    const current = mapping.get(storeId) ?? [];
-    if (!current.includes(webhookConfigId)) {
-      current.push(webhookConfigId);
+    const current = mapping.get(storeId) ?? {
+      webhookConfigIds: [],
+      lastMappedAt: row.created_at ?? null,
+    };
+
+    if (!current.webhookConfigIds.includes(webhookConfigId)) {
+      current.webhookConfigIds.push(webhookConfigId);
     }
+
+    if (!current.lastMappedAt) {
+      current.lastMappedAt = row.created_at ?? null;
+    }
+
     mapping.set(storeId, current);
   }
 
@@ -608,7 +681,7 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const { rows: stores, hasActiveWebhookColumn } = await loadStores(user.id);
+    const { rows: stores } = await loadStores(user.id);
     const subscriptions = await loadSubscriptions(user.id);
     const subscriptionIds = subscriptions.map((row) => row.id);
     const storeIds = stores.map((store) => store.id);
@@ -632,9 +705,8 @@ export async function GET(request: NextRequest) {
       countsByStoreId.set(singleStoreId, (countsByStoreId.get(singleStoreId) ?? 0) + orphanPaidCount);
     }
 
-    const fallbackStoreWebhookMap = hasActiveWebhookColumn
-      ? new Map<string, string[]>()
-      : await loadStoreWebhookMappingsFromLogs(storeIds);
+    const fallbackStoreWebhookMap = await loadStoreWebhookMappingsFromLogs(storeIds);
+    const directMode = isDirectAutomationMode();
     const activeAutomationWebhookIds = await loadActiveAutomationWebhookIds();
     const singletonActiveWebhookId =
       activeAutomationWebhookIds.size === 1 ? Array.from(activeAutomationWebhookIds)[0] : null;
@@ -646,7 +718,7 @@ export async function GET(request: NextRequest) {
         return explicitId;
       }
 
-      const fallbackCandidates = fallbackStoreWebhookMap.get(store.id) ?? [];
+      const fallbackCandidates = fallbackStoreWebhookMap.get(store.id)?.webhookConfigIds ?? [];
       for (const candidateId of fallbackCandidates) {
         if (activeAutomationWebhookIds.has(candidateId)) {
           return candidateId;
@@ -699,47 +771,94 @@ export async function GET(request: NextRequest) {
 
       const lastSuccessfulAutomationAt = getMostRecentIso(cadenceAnchorJobs);
       const latestScheduledSlotDueMs = getLatestScheduledSlotDueMs(storeScopedJobs);
+      const mappingSnapshot = fallbackStoreWebhookMap.get(store.id);
 
       let nextAutomationAtMs: number | null = null;
+      let slotJobForState: SchedulerJobRow | null = null;
+      let slotRetryCount = 0;
 
       if (intervalMs !== null && hasActiveAutomationWebhook) {
-        if (lastSuccessfulAutomationAt) {
-          nextAutomationAtMs = new Date(lastSuccessfulAutomationAt).getTime() + intervalMs;
-        } else if (latestScheduledSlotDueMs !== null) {
-          nextAutomationAtMs = latestScheduledSlotDueMs;
+        if (directMode) {
+          const directAnchorIso =
+            toIsoOrNull(store.automation_updated_at) ??
+            toIsoOrNull(mappingSnapshot?.lastMappedAt) ??
+            toIsoOrNull(lastSuccessfulAutomationAt) ??
+            toIsoOrNull(primarySubscription?.updated_at) ??
+            toIsoOrNull(primarySubscription?.created_at) ??
+            new Date(nowMs).toISOString();
+
+          nextAutomationAtMs = computeRollingNextAtMs(directAnchorIso, intervalMs, nowMs);
         } else {
-          nextAutomationAtMs = nowMs;
+        let slotDueMs = (() => {
+          if (lastSuccessfulAutomationAt) {
+            return new Date(lastSuccessfulAutomationAt).getTime() + intervalMs;
+          }
+
+          if (latestScheduledSlotDueMs !== null) {
+            return latestScheduledSlotDueMs;
+          }
+
+          return nowMs;
+        })();
+
+        if (primarySubscription?.id && plan) {
+          let slotDueIso = new Date(slotDueMs).toISOString();
+          let slotKey = createScheduledSlotIdempotencyKey({
+            subscriptionId: primarySubscription.id,
+            storeId: store.id,
+            plan,
+            slotDueAtIso: slotDueIso,
+          });
+          let slotJob = findScheduledSlotJob(storeScopedJobs, store.id, slotKey);
+
+          while (
+            slotJob &&
+            (slotJob.status ?? "").toLowerCase() === "failed" &&
+            (slotJob.retry_count ?? 0) >= 5
+          ) {
+            slotDueMs += intervalMs;
+            slotDueIso = new Date(slotDueMs).toISOString();
+            slotKey = createScheduledSlotIdempotencyKey({
+              subscriptionId: primarySubscription.id,
+              storeId: store.id,
+              plan,
+              slotDueAtIso: slotDueIso,
+            });
+            slotJob = findScheduledSlotJob(storeScopedJobs, store.id, slotKey);
+          }
+
+          slotJobForState = slotJob;
+          slotRetryCount = slotJob?.retry_count ?? 0;
+
+          if (slotJob && (slotJob.status ?? "").toLowerCase() === "failed") {
+            if (slotRetryCount < 5) {
+              const retryAtMs = getJobTimestamp(slotJob) + getRetryDelayMinutes(slotRetryCount) * 60 * 1000;
+              nextAutomationAtMs = retryAtMs;
+            } else {
+              nextAutomationAtMs = slotDueMs + intervalMs;
+            }
+          } else {
+            nextAutomationAtMs = slotDueMs;
+          }
+        } else {
+          nextAutomationAtMs = slotDueMs;
         }
-      }
-
-      const latestScheduledFailedJob = storeScopedJobs
-        .filter((job) => isScheduledJob(job) && (job.status ?? "").toLowerCase() === "failed")
-        .sort((a, b) => getJobTimestamp(b) - getJobTimestamp(a))[0];
-
-      const retryCount = latestScheduledFailedJob?.retry_count ?? 0;
-      const hasRetryWindow = Boolean(latestScheduledFailedJob) && retryCount < 5;
-
-      if (hasActiveAutomationWebhook && hasRetryWindow && latestScheduledFailedJob) {
-        const delayMinutes = getRetryDelayMinutes(retryCount);
-        const retryAtMs = getJobTimestamp(latestScheduledFailedJob) + delayMinutes * 60 * 1000;
-        nextAutomationAtMs = retryAtMs;
-      } else if (
-        hasActiveAutomationWebhook &&
-        latestScheduledFailedJob &&
-        retryCount >= 5 &&
-        nextAutomationAtMs !== null &&
-        intervalMs !== null
-      ) {
-        const slotDueIso = extractScheduledSlotDueIso(latestScheduledFailedJob.idempotency_key);
-        const slotDueMs = slotDueIso ? new Date(slotDueIso).getTime() : null;
-        if (slotDueMs !== null && !Number.isNaN(slotDueMs) && slotDueMs >= nextAutomationAtMs) {
-          nextAutomationAtMs = slotDueMs + intervalMs;
         }
       }
 
       const nextAutomationAt = nextAutomationAtMs !== null ? new Date(nextAutomationAtMs).toISOString() : null;
+      const hasRetryWindow =
+        !directMode &&
+        Boolean(slotJobForState) &&
+        (slotJobForState?.status ?? "").toLowerCase() === "failed" &&
+        slotRetryCount < 5;
+      const hasTerminalFailure =
+        !directMode &&
+        Boolean(slotJobForState) &&
+        (slotJobForState?.status ?? "").toLowerCase() === "failed" &&
+        slotRetryCount >= 5;
 
-      const hasProcessingAutomation = subscriptionJobs.some((job) => {
+      const hasProcessingAutomation = !directMode && subscriptionJobs.some((job) => {
         const status = (job.status ?? "").toLowerCase();
         if (status !== "processing") {
           return false;
@@ -774,7 +893,7 @@ export async function GET(request: NextRequest) {
           return "due";
         }
 
-        if (latestScheduledFailedJob && retryCount >= 5) {
+        if (hasTerminalFailure) {
           return "error";
         }
 
@@ -802,30 +921,32 @@ export async function GET(request: NextRequest) {
       };
     });
 
-    const nowMs = Date.now();
-    const hasDueAutomation = rows.some((row) => {
-      if (!row.hasActiveSubscription || !row.hasActiveAutomationWebhook || row.automationState === "processing") {
-        return false;
-      }
+    if (!directMode) {
+      const nowMs = Date.now();
+      const hasDueAutomation = rows.some((row) => {
+        if (!row.hasActiveSubscription || !row.hasActiveAutomationWebhook || row.automationState === "processing") {
+          return false;
+        }
 
-      if (!row.nextAutomationAt) {
-        return false;
-      }
+        if (!row.nextAutomationAt) {
+          return false;
+        }
 
-      const nextAutomationAtMs = new Date(row.nextAutomationAt).getTime();
-      if (Number.isNaN(nextAutomationAtMs)) {
-        return false;
-      }
+        const nextAutomationAtMs = new Date(row.nextAutomationAt).getTime();
+        if (Number.isNaN(nextAutomationAtMs)) {
+          return false;
+        }
 
-      return nextAutomationAtMs <= nowMs;
-    });
+        return nextAutomationAtMs <= nowMs;
+      });
 
-    if (hasDueAutomation) {
-      const latestCronTickMs = await loadLatestCronTickMs();
-      const isCronStale = latestCronTickMs === null || nowMs - latestCronTickMs > 3 * 60 * 1000;
+      if (hasDueAutomation) {
+        const latestCronTickMs = await loadLatestCronTickMs();
+        const isCronStale = latestCronTickMs === null || nowMs - latestCronTickMs > 3 * 60 * 1000;
 
-      if (isCronStale) {
-        await triggerTickWithCronSecret(request);
+        if (isCronStale) {
+          await triggerTickWithCronSecret(request);
+        }
       }
     }
 

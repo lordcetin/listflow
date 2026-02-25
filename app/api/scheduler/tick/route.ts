@@ -62,6 +62,9 @@ const isAuthorized = (request: NextRequest) => {
   return providedTokens.some((token) => token === serverEnv.CRON_SECRET);
 };
 
+const isDirectAutomationMode = () =>
+  (process.env.AUTOMATION_DISPATCH_MODE?.trim().toLowerCase() || "direct") === "direct";
+
 const isMissingColumnError = (error: { message?: string } | null | undefined, columnName: string) => {
   if (!error) {
     return false;
@@ -222,7 +225,17 @@ const runTick = async (request: NextRequest) => {
   }
 
   try {
-    const summary = await runSchedulerTick();
+    const summary = isDirectAutomationMode()
+      ? {
+          total: 0,
+          triggered: 0,
+          skipped: 0,
+          failed: 0,
+          reasonBreakdown: {
+            direct_mode_enabled: 1,
+          },
+        }
+      : await runSchedulerTick();
     let cronTestSummary: Awaited<ReturnType<typeof runCronTestTick>> | null = null;
     let cronTestError: string | null = null;
 

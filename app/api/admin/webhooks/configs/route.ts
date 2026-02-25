@@ -3,6 +3,7 @@ import { requireAdminRequest, notFoundResponse } from "@/lib/auth/admin-request"
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { persistWebhookConfigProductMap } from "@/lib/webhooks/config-product-map";
 import { syncSchedulerCronJobLifecycle } from "@/lib/cron-job-org/client";
+import { isUuid } from "@/lib/utils/uuid";
 
 type QueryError = { message?: string; code?: string | null };
 
@@ -49,6 +50,305 @@ const parseHeaders = (value: unknown) => {
     }
   }
   return next;
+};
+
+const isMissingColumnError = (error: QueryError | null | undefined, columnName: string) => {
+  if (!error) {
+    return false;
+  }
+
+  const message = (error.message ?? "").toLowerCase();
+  return message.includes("column") && message.includes(columnName.toLowerCase());
+};
+
+const isMissingAnyColumnError = (error: QueryError | null | undefined, columns: string[]) => {
+  if (!error) {
+    return false;
+  }
+
+  return columns.some((column) => isMissingColumnError(error, column));
+};
+
+const loadActiveSubscriptionStoreIds = async () => {
+  const withStoreId = await supabaseAdmin
+    .from("subscriptions")
+    .select("store_id, shop_id, status")
+    .in("status", ["active", "trialing"])
+    .limit(5000);
+
+  if (!withStoreId.error) {
+    const ids = new Set<string>();
+
+    for (const row of (withStoreId.data ?? []) as Array<{ store_id?: string | null; shop_id?: string | null }>) {
+      const candidate = row.store_id ?? (row.shop_id && isUuid(row.shop_id) ? row.shop_id : null);
+      if (candidate && isUuid(candidate)) {
+        ids.add(candidate);
+      }
+    }
+
+    return Array.from(ids);
+  }
+
+  if (!isMissingColumnError(withStoreId.error, "store_id")) {
+    throw new Error(withStoreId.error.message ?? "subscriptions could not be loaded");
+  }
+
+  const fallback = await supabaseAdmin
+    .from("subscriptions")
+    .select("shop_id, status")
+    .in("status", ["active", "trialing"])
+    .limit(5000);
+
+  if (fallback.error) {
+    throw new Error(fallback.error.message ?? "subscriptions could not be loaded");
+  }
+
+  const ids = new Set<string>();
+  for (const row of (fallback.data ?? []) as Array<{ shop_id?: string | null }>) {
+    if (row.shop_id && isUuid(row.shop_id)) {
+      ids.add(row.shop_id);
+    }
+  }
+
+  return Array.from(ids);
+};
+
+const loadExistingStoreIds = async (storeIds: string[]) => {
+  if (!storeIds.length) {
+    return [] as string[];
+  }
+
+  const { data, error } = await supabaseAdmin.from("stores").select("id").in("id", storeIds);
+  if (error) {
+    throw new Error(error.message ?? "stores could not be loaded");
+  }
+
+  return ((data ?? []) as Array<{ id: string }>).map((row) => row.id);
+};
+
+const loadActiveAutomationWebhookIds = async () => {
+  const selectCandidates = [
+    "id,enabled,scope",
+    "id,enabled",
+    "id,scope",
+    "id",
+  ] as const;
+
+  for (const select of selectCandidates) {
+    const query = await supabaseAdmin.from("webhook_configs").select(select).limit(5000);
+    if (query.error) {
+      if (!isRecoverableColumnError(query.error)) {
+        throw new Error(query.error.message ?? "webhook configs could not be loaded");
+      }
+      continue;
+    }
+
+    const ids = new Set<string>();
+    for (const row of ((query.data ?? []) as unknown as Array<{ id: string; enabled?: boolean | null; scope?: string | null }>)) {
+      if (row.enabled === false) {
+        continue;
+      }
+
+      if (row.scope === "generic") {
+        continue;
+      }
+
+      ids.add(row.id);
+    }
+
+    return ids;
+  }
+
+  return new Set<string>();
+};
+
+const loadLatestStoreWebhookMap = async (storeIds: string[]) => {
+  const result = new Map<string, string>();
+  if (!storeIds.length) {
+    return result;
+  }
+
+  const { data, error } = await supabaseAdmin
+    .from("webhook_logs")
+    .select("request_body, created_at")
+    .eq("request_method", "STORE_WEBHOOK_MAP")
+    .order("created_at", { ascending: false })
+    .limit(5000);
+
+  if (error) {
+    if (isRecoverableColumnError(error)) {
+      return result;
+    }
+    throw new Error(error.message ?? "store webhook mappings could not be loaded");
+  }
+
+  const allowedStoreIds = new Set(storeIds);
+  for (const row of (data ?? []) as Array<{ request_body: unknown }>) {
+    const body =
+      typeof row.request_body === "object" && row.request_body !== null
+        ? (row.request_body as Record<string, unknown>)
+        : null;
+    if (!body) {
+      continue;
+    }
+
+    const storeId = typeof body.store_id === "string" ? body.store_id : null;
+    const webhookConfigId = typeof body.webhook_config_id === "string" ? body.webhook_config_id : null;
+    if (!storeId || !webhookConfigId || !allowedStoreIds.has(storeId)) {
+      continue;
+    }
+
+    if (!result.has(storeId)) {
+      result.set(storeId, webhookConfigId);
+    }
+  }
+
+  return result;
+};
+
+const persistStoreWebhookMappingLog = async (args: {
+  storeId: string;
+  webhookConfigId: string;
+  createdBy: string;
+}) => {
+  const payload = {
+    store_id: args.storeId,
+    webhook_config_id: args.webhookConfigId,
+    idempotency_key: `auto_bind:${args.storeId}:${args.webhookConfigId}:${Date.now()}`,
+  };
+
+  const candidates: Array<Record<string, unknown>> = [
+    {
+      request_url: "store-webhook-mapping-auto-bind",
+      request_method: "STORE_WEBHOOK_MAP",
+      request_headers: {},
+      request_body: payload,
+      response_status: 200,
+      response_body: "mapping_saved",
+      duration_ms: 0,
+      created_by: args.createdBy,
+    },
+    {
+      request_url: "store-webhook-mapping-auto-bind",
+      request_method: "STORE_WEBHOOK_MAP",
+      request_body: payload,
+    },
+  ];
+
+  for (const candidate of candidates) {
+    const { error } = await supabaseAdmin.from("webhook_logs").insert(candidate);
+    if (!error) {
+      return true;
+    }
+
+    if (!isRecoverableColumnError(error)) {
+      throw new Error(error.message ?? "webhook mapping log could not be inserted");
+    }
+  }
+
+  return false;
+};
+
+const tryUpdateStoreBindingColumn = async (args: {
+  storeId: string;
+  webhookConfigId: string;
+  adminUserId: string;
+}) => {
+  const nowIso = new Date().toISOString();
+  const payloads: Array<Record<string, unknown>> = [
+    {
+      active_webhook_config_id: args.webhookConfigId,
+      automation_updated_at: nowIso,
+      automation_updated_by: args.adminUserId,
+    },
+    {
+      active_webhook_config_id: args.webhookConfigId,
+      automation_updated_at: nowIso,
+    },
+    {
+      active_webhook_config_id: args.webhookConfigId,
+    },
+  ];
+
+  for (const payload of payloads) {
+    const update = await supabaseAdmin.from("stores").update(payload).eq("id", args.storeId);
+    if (!update.error) {
+      return { updated: true };
+    }
+
+    const recoverable = isMissingAnyColumnError(update.error, [
+      "active_webhook_config_id",
+      "automation_updated_at",
+      "automation_updated_by",
+    ]);
+
+    if (!recoverable) {
+      throw new Error(update.error.message ?? "stores binding update failed");
+    }
+  }
+
+  return { updated: false };
+};
+
+const autoBindWebhookToActiveStores = async (args: {
+  webhookConfigId: string;
+  adminUserId: string;
+}) => {
+  const activeSubscriptionStoreIds = await loadActiveSubscriptionStoreIds();
+  const storeIds = await loadExistingStoreIds(activeSubscriptionStoreIds);
+  const activeWebhookIds = await loadActiveAutomationWebhookIds();
+  const latestMappings = await loadLatestStoreWebhookMap(storeIds);
+
+  let mappedCount = 0;
+  let storeColumnUpdates = 0;
+  let logMappings = 0;
+  let skippedAlreadyMapped = 0;
+  let forceReboundCount = 0;
+  const forceRebindSingleStore = storeIds.length === 1;
+
+  for (const storeId of storeIds) {
+    const mappedWebhookId = latestMappings.get(storeId);
+    const hasActiveMappedWebhook = Boolean(mappedWebhookId && activeWebhookIds.has(mappedWebhookId));
+
+    if (hasActiveMappedWebhook && !forceRebindSingleStore) {
+      skippedAlreadyMapped += 1;
+      continue;
+    }
+
+    if (hasActiveMappedWebhook && forceRebindSingleStore) {
+      forceReboundCount += 1;
+    }
+
+    const columnResult = await tryUpdateStoreBindingColumn({
+      storeId,
+      webhookConfigId: args.webhookConfigId,
+      adminUserId: args.adminUserId,
+    });
+
+    if (columnResult.updated) {
+      storeColumnUpdates += 1;
+    }
+
+    const logSaved = await persistStoreWebhookMappingLog({
+      storeId,
+      webhookConfigId: args.webhookConfigId,
+      createdBy: args.adminUserId,
+    });
+
+    if (logSaved) {
+      logMappings += 1;
+    }
+
+    mappedCount += 1;
+  }
+
+  return {
+    mappedCount,
+    storeColumnUpdates,
+    logMappings,
+    skippedAlreadyMapped,
+    forceReboundCount,
+  };
 };
 
 const resolveProductTitle = async (productId: string) => {
@@ -224,8 +524,14 @@ export async function POST(request: NextRequest) {
             createdBy: admin.user.id,
           });
         }
+        const autoBind = data?.id && payload.enabled
+          ? await autoBindWebhookToActiveStores({
+              webhookConfigId: data.id,
+              adminUserId: admin.user.id,
+            })
+          : { mappedCount: 0, storeColumnUpdates: 0, logMappings: 0, skippedAlreadyMapped: 0, forceReboundCount: 0 };
         const cronSync = await syncSchedulerCronJobLifecycle();
-        return NextResponse.json({ row: data, cronSync });
+        return NextResponse.json({ row: data, cronSync, autoBind });
       }
 
       if (error.code === "23505") {
