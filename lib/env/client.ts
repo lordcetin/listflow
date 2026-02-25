@@ -1,5 +1,6 @@
 const nextPublicSupabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const nextPublicSupabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+const nextPublicSiteUrl = process.env.NEXT_PUBLIC_SITE_URL;
 
 if (!nextPublicSupabaseUrl || !nextPublicSupabaseUrl.trim()) {
   throw new Error(
@@ -18,6 +19,7 @@ if (!nextPublicSupabaseAnonKey || !nextPublicSupabaseAnonKey.trim()) {
 export const clientEnv = {
   NEXT_PUBLIC_SUPABASE_URL: nextPublicSupabaseUrl,
   NEXT_PUBLIC_SUPABASE_ANON_KEY: nextPublicSupabaseAnonKey,
+  NEXT_PUBLIC_SITE_URL: nextPublicSiteUrl?.trim() || null,
 } as const;
 
 export type Locale = "tr" | "en";

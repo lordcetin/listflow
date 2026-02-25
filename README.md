@@ -45,6 +45,7 @@ Listflow automation scheduler endpoint:
 ### Required env
 
 - `CRON_SECRET` (required)
+- `NEXT_PUBLIC_SITE_URL=https://listflow.pro` (Google OAuth redirect base)
 - `APP_URL=https://listflow.pro`
 - `CRON_SCHEDULER_BASE_URL=https://listflow.pro`
 - `CRON_JOB_ORG_API_KEY=<cron-job.org api key>` (opsiyonel, `CRON_SECRET` fallback'i var)

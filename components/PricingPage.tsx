@@ -21,6 +21,7 @@ import {
   X,
 } from "lucide-react";
 import Footer from "@/components/Footer";
+import { buildOAuthRedirectTo } from "@/lib/auth/oauth-client";
 import { useI18n } from "@/lib/i18n/provider";
 import { useCategoriesRepository } from "@/lib/repositories/categories";
 import { supabase } from "@/lib/supabaseClient";
@@ -684,7 +685,7 @@ const PricingPage = () => {
 
     try {
       const nextPath = `/pricing?onboarding=1&plan=${selectedPlan}&interval=${billingInterval}`;
-      const redirectTo = `${window.location.origin}/auth/callback?next=${encodeURIComponent(nextPath)}`;
+      const redirectTo = buildOAuthRedirectTo(`/auth/callback?next=${encodeURIComponent(nextPath)}`);
 
       const { error } = await supabase.auth.signInWithOAuth({
         provider: "google",

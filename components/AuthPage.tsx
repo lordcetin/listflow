@@ -7,6 +7,7 @@ import { View } from '../types';
 import { supabase } from '../lib/supabaseClient';
 import { Rocket, Mail, Lock, ArrowLeft, User, AlertCircle, Loader2 } from 'lucide-react';
 import { useI18n } from '@/lib/i18n/provider';
+import { buildOAuthRedirectTo } from '@/lib/auth/oauth-client';
 
 const AuthPage: React.FC = () => {
   const { setView } = useStore();
@@ -111,7 +112,7 @@ const AuthPage: React.FC = () => {
     setError(null);
 
     try {
-      const redirectTo = `${window.location.origin}/auth/callback`;
+      const redirectTo = buildOAuthRedirectTo('/auth/callback');
       const { error: oauthError } = await supabase.auth.signInWithOAuth({
         provider: 'google',
         options: { redirectTo },
