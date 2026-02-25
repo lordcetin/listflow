@@ -345,47 +345,35 @@ const callCronJobOrgApi = async <T>(args: {
   return JSON.parse(text) as T;
 };
 
-const buildAnchoredHours = (intervalHours: number, anchorHour: number) => {
+const buildFixedPlanHours = (intervalHours: number) => {
   const safeInterval = intervalHours >= 1 ? intervalHours : 8;
-  const safeHour = ((anchorHour % 24) + 24) % 24;
-  const remainder = safeHour % safeInterval;
   const hours: number[] = [];
 
-  for (let hour = remainder; hour < 24; hour += safeInterval) {
+  for (let hour = 0; hour < 24; hour += safeInterval) {
     hours.push(hour);
   }
 
-  return hours.length ? hours : [safeHour];
+  return hours.length ? hours : [0];
 };
 
-const createAutomationSchedule = (plan: string | null | undefined, anchorIso: string) => {
+const createAutomationSchedule = (plan: string | null | undefined) => {
   const intervalHours = getPlanWindowHours(plan ?? "standard");
-  const anchor = new Date(anchorIso);
-  const hour = Number.isNaN(anchor.getTime()) ? 0 : anchor.getUTCHours();
-  const minute = Number.isNaN(anchor.getTime()) ? 0 : anchor.getUTCMinutes();
 
   return {
     timezone: "UTC",
     expiresAt: 0,
-    hours: buildAnchoredHours(intervalHours, hour),
+    hours: buildFixedPlanHours(intervalHours),
     mdays: [-1],
-    minutes: [minute],
+    minutes: [0],
     months: [-1],
     wdays: [-1],
   } satisfies CronJobSchedule;
 };
 
-const computeNextExecutionUnix = (args: { anchorIso: string; plan: string; nowMs: number }) => {
+const computeNextExecutionUnix = (args: { plan: string; nowMs: number }) => {
   const intervalMs = Math.max(1, getPlanWindowHours(args.plan)) * 60 * 60 * 1000;
-  const anchorMs = toTimestamp(args.anchorIso) ?? args.nowMs;
-
-  if (anchorMs > args.nowMs) {
-    return Math.floor(anchorMs / 1000);
-  }
-
-  const elapsed = args.nowMs - anchorMs;
-  const steps = Math.floor(elapsed / intervalMs) + 1;
-  return Math.floor((anchorMs + steps * intervalMs) / 1000);
+  const nextMs = Math.ceil(args.nowMs / intervalMs) * intervalMs;
+  return Math.floor(nextMs / 1000);
 };
 
 const buildAutomationTitle = (args: {
@@ -743,7 +731,7 @@ const buildDesiredDirectJobs = async (nowMs: number) => {
       url: webhook.target_url,
       redirectSuccess: true,
       requestMethod: method === "GET" ? GET_REQUEST_METHOD : POST_REQUEST_METHOD,
-      schedule: createAutomationSchedule(plan, anchorIso),
+      schedule: createAutomationSchedule(plan),
       extendedData: {
         headers: {
           ...(method === "POST" ? { "Content-Type": "application/json" } : {}),
@@ -859,7 +847,6 @@ const buildDesiredDirectCronRows = async (nowMs: number) => {
     .sort((a, b) => a.title.localeCompare(b.title))
     .map((job, index) => {
       const nextExecution = computeNextExecutionUnix({
-        anchorIso: job.anchorIso,
         plan: job.plan,
         nowMs,
       });
