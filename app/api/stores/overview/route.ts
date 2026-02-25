@@ -78,6 +78,18 @@ const isRecoverableColumnError = (error: { message?: string } | null | undefined
   return columns.some((column) => isMissingColumnError(error, column));
 };
 
+const chunkArray = <T>(items: T[], size: number) => {
+  if (size <= 0) {
+    return [items];
+  }
+
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+};
+
 const isDirectAutomationMode = () =>
   (process.env.AUTOMATION_DISPATCH_MODE?.trim().toLowerCase() || "direct") === "direct";
 
@@ -561,7 +573,9 @@ const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
     const isManualBinding = sourceUrl === "store-webhook-mapping" || (idempotencyKey?.startsWith("manual_switch:") ?? false);
     const isActivationBinding =
       sourceUrl === "store-webhook-mapping-activation" || (idempotencyKey?.startsWith("activation:") ?? false);
-    if (!isManualBinding && !isActivationBinding) {
+    const isAutoBindMapping =
+      sourceUrl === "store-webhook-mapping-auto-bind" || (idempotencyKey?.startsWith("auto_bind:") ?? false);
+    if (!isManualBinding && !isActivationBinding && !isAutoBindMapping) {
       continue;
     }
 
@@ -591,7 +605,12 @@ const loadStoreWebhookMappingsFromLogs = async (storeIds: string[]) => {
   return mapping;
 };
 
-const loadActiveAutomationWebhookIds = async () => {
+const loadActiveAutomationWebhookIdsByIds = async (webhookConfigIds: string[]) => {
+  const uniqueIds = Array.from(new Set(webhookConfigIds.filter((value): value is string => Boolean(value))));
+  if (!uniqueIds.length) {
+    return new Set<string>();
+  }
+
   const candidates = [
     "id, enabled, scope",
     "id, enabled",
@@ -599,42 +618,50 @@ const loadActiveAutomationWebhookIds = async () => {
     "id",
   ] as const;
 
-  for (const select of candidates) {
-    const query = supabaseAdmin
-      .from("webhook_configs")
-      .select(select)
-      .order("created_at", { ascending: false })
-      .limit(2000);
+  const activeIds = new Set<string>();
+  const idChunks = chunkArray(uniqueIds, 200);
 
-    const { data, error } = await query;
+  for (const idChunk of idChunks) {
+    let resolvedChunk = false;
 
-    if (error) {
-      if (!isRecoverableColumnError(error, ["enabled", "scope"])) {
-        throw new Error(error.message);
-      }
+    for (const select of candidates) {
+      const { data, error } = await supabaseAdmin
+        .from("webhook_configs")
+        .select(select)
+        .in("id", idChunk);
 
-      continue;
-    }
-
-    const rows = (data ?? []) as unknown as Array<{ id: string; enabled?: boolean | null; scope?: string | null }>;
-    const activeIds = new Set<string>();
-
-    for (const row of rows) {
-      if (row.enabled === false) {
+      if (error) {
+        if (!isRecoverableColumnError(error, ["enabled", "scope"])) {
+          throw new Error(error.message);
+        }
         continue;
       }
 
-      if (row.scope && row.scope === "generic") {
-        continue;
+      const rows = (data ?? []) as unknown as Array<{ id: string; enabled?: boolean | null; scope?: string | null }>;
+      for (const row of rows) {
+        if (row.enabled === false) {
+          continue;
+        }
+
+        if (row.scope && row.scope === "generic") {
+          continue;
+        }
+
+        activeIds.add(row.id);
       }
 
-      activeIds.add(row.id);
+      resolvedChunk = true;
+      break;
     }
 
-    return activeIds;
+    if (!resolvedChunk) {
+      for (const fallbackId of idChunk) {
+        activeIds.add(fallbackId);
+      }
+    }
   }
 
-  return new Set<string>();
+  return activeIds;
 };
 
 const loadLatestCronTickMs = async () => {
@@ -716,7 +743,19 @@ export async function GET(request: NextRequest) {
 
     const fallbackStoreWebhookMap = await loadStoreWebhookMappingsFromLogs(storeIds);
     const directMode = isDirectAutomationMode();
-    const activeAutomationWebhookIds = await loadActiveAutomationWebhookIds();
+    const candidateWebhookIds = new Set<string>();
+    for (const store of stores) {
+      if (store.active_webhook_config_id) {
+        candidateWebhookIds.add(store.active_webhook_config_id);
+      }
+
+      const fallbackIds = fallbackStoreWebhookMap.get(store.id)?.webhookConfigIds ?? [];
+      for (const fallbackId of fallbackIds) {
+        candidateWebhookIds.add(fallbackId);
+      }
+    }
+
+    const activeAutomationWebhookIds = await loadActiveAutomationWebhookIdsByIds(Array.from(candidateWebhookIds));
     const resolveStoreWebhookId = (store: StoreRow) => {
       const explicitId = store.active_webhook_config_id;
 
