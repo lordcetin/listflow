@@ -2,9 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { ACCESS_TOKEN_COOKIE } from "@/lib/auth/session";
 import { getUserFromAccessToken } from "@/lib/auth/admin";
 import { supabaseAdmin } from "@/lib/supabase/admin";
-import { serverEnv } from "@/lib/env/server";
 import { getActiveStripeMode, getStripeClientForMode, type StripeMode } from "@/lib/stripe/client";
 import { isSubscriptionActive, loadUserSubscriptions } from "@/lib/settings/subscriptions";
+import { resolvePublicSiteUrl } from "@/lib/url/public-site";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -63,6 +63,7 @@ const resolveCustomerFromStripeSubscription = async (subscriptionId: string | nu
 
 export async function POST(request: NextRequest) {
   try {
+    const appUrl = resolvePublicSiteUrl(request);
     const accessToken = getAccessToken(request);
     if (!accessToken) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -117,7 +118,7 @@ export async function POST(request: NextRequest) {
         try {
           const session = await getStripeClientForMode(mode).billingPortal.sessions.create({
             customer: customerId,
-            return_url: `${serverEnv.APP_URL}/`,
+            return_url: `${appUrl}/`,
           });
 
           return NextResponse.json({ url: session.url });

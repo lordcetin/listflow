@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { serverEnv } from "@/lib/env/server";
 import { getUserFromAccessToken } from "@/lib/auth/admin";
 import { ACCESS_TOKEN_COOKIE } from "@/lib/auth/session";
 import { getStripeClientForMode, type BillingInterval, type BillingPlan } from "@/lib/stripe/client";
 import { resolveCheckoutPriceId } from "@/lib/stripe/plans";
+import { resolvePublicSiteUrl } from "@/lib/url/public-site";
 
 export const runtime = "nodejs";
 
@@ -30,6 +30,7 @@ export async function POST(request: NextRequest) {
   try {
     const stripe = getStripeClientForMode();
     const body = (await request.json()) as SubscriptionPayload | OneTimePayload;
+    const appUrl = resolvePublicSiteUrl(request);
 
     const accessToken = request.cookies.get(ACCESS_TOKEN_COOKIE)?.value;
 
@@ -55,8 +56,8 @@ export async function POST(request: NextRequest) {
         mode: "subscription",
         payment_method_types: ["card"],
         line_items: [{ price: priceId, quantity: 1 }],
-        success_url: `${serverEnv.APP_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}&type=sub`,
-        cancel_url: `${serverEnv.APP_URL}/?cancelled=1`,
+        success_url: `${appUrl}/payment-success?session_id={CHECKOUT_SESSION_ID}&type=sub`,
+        cancel_url: `${appUrl}/?cancelled=1`,
         subscription_data: {
           metadata: {
             userId: user.id,
@@ -83,8 +84,8 @@ export async function POST(request: NextRequest) {
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
       mode: "payment",
-      success_url: `${serverEnv.APP_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}&type=one_time`,
-      cancel_url: `${serverEnv.APP_URL}/?cancelled=1`,
+      success_url: `${appUrl}/payment-success?session_id={CHECKOUT_SESSION_ID}&type=one_time`,
+      cancel_url: `${appUrl}/?cancelled=1`,
       line_items: [
         {
           price_data: {

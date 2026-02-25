@@ -1,5 +1,6 @@
 import { serverEnv } from "@/lib/env/server";
 import { supabaseAdmin } from "@/lib/supabase/admin";
+import { resolvePublicSiteUrl } from "@/lib/url/public-site";
 
 const CRON_JOB_ORG_BASE_URL = "https://api.cron-job.org";
 const LISTFLOW_SCHEDULER_TITLE = "Listflow Scheduler Tick";
@@ -63,8 +64,12 @@ export type SchedulerCronSyncResult =
 const stripTrailingSlashes = (value: string) => value.replace(/\/+$/, "");
 
 const resolveSchedulerBaseUrl = () => {
-  const raw = serverEnv.CRON_SCHEDULER_BASE_URL ?? serverEnv.APP_URL;
-  return stripTrailingSlashes(raw);
+  const raw = serverEnv.CRON_SCHEDULER_BASE_URL;
+  if (raw && raw.trim()) {
+    return stripTrailingSlashes(raw);
+  }
+
+  return stripTrailingSlashes(resolvePublicSiteUrl());
 };
 
 const schedulerTickUrl = () => `${resolveSchedulerBaseUrl()}/api/scheduler/tick`;
