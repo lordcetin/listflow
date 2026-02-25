@@ -5,7 +5,6 @@ import {
   getCronTestConfigById,
   updateCronTestConfig,
 } from "@/lib/webhooks/cron-test";
-import { syncSchedulerCronJobLifecycle } from "@/lib/cron-job-org/client";
 
 const parseUrl = (value: unknown) => {
   if (typeof value !== "string") {
@@ -98,7 +97,11 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
     };
 
     const updated = await updateCronTestConfig(id, patch);
-    const cronSync = await syncSchedulerCronJobLifecycle();
+    const cronSync = {
+      ok: true as const,
+      status: "noop" as const,
+      message: "Cron test webhook güncellendi. Ana cron sync değişmedi.",
+    };
 
     return NextResponse.json({
       row: {
@@ -132,7 +135,11 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
     }
 
     await deleteCronTestConfig(id);
-    const cronSync = await syncSchedulerCronJobLifecycle();
+    const cronSync = {
+      ok: true as const,
+      status: "noop" as const,
+      message: "Cron test webhook silindi. Ana cron sync değişmedi.",
+    };
     return NextResponse.json({ success: true, cronSync });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Cron test webhook silinemedi.";

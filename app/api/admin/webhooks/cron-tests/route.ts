@@ -6,7 +6,6 @@ import {
   loadCronTestConfigs,
   loadCronTestLatestRuns,
 } from "@/lib/webhooks/cron-test";
-import { syncSchedulerCronJobLifecycle } from "@/lib/cron-job-org/client";
 
 const parseUrl = (value: unknown) => {
   if (typeof value !== "string") {
@@ -136,7 +135,11 @@ export async function POST(request: NextRequest) {
       headers,
       enabled,
     });
-    const cronSync = await syncSchedulerCronJobLifecycle();
+    const cronSync = {
+      ok: true as const,
+      status: "noop" as const,
+      message: "Cron test webhook kaydedildi. Ana cron sync değişmedi.",
+    };
 
     return NextResponse.json({
       row: {

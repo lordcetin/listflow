@@ -2,7 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { requireAdminRequest, notFoundResponse } from "@/lib/auth/admin-request";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { persistWebhookConfigProductMap } from "@/lib/webhooks/config-product-map";
-import { syncSchedulerCronJobLifecycle } from "@/lib/cron-job-org/client";
 
 type QueryError = { message?: string; code?: string | null };
 
@@ -191,7 +190,11 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
             createdBy: admin.user.id,
           });
         }
-        const cronSync = await syncSchedulerCronJobLifecycle();
+        const cronSync = {
+          ok: true as const,
+          status: "noop" as const,
+          message: "Webhook güncellendi. Cron sync otomatik tetiklenmedi (rate-limit koruması).",
+        };
         return NextResponse.json({ row: data, cronSync });
       }
 
@@ -224,6 +227,10 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 
-  const cronSync = await syncSchedulerCronJobLifecycle();
+  const cronSync = {
+    ok: true as const,
+    status: "noop" as const,
+    message: "Webhook silindi. Cron sync otomatik tetiklenmedi (rate-limit koruması).",
+  };
   return NextResponse.json({ success: true, cronSync });
 }

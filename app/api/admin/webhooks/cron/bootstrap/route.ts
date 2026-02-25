@@ -17,7 +17,7 @@ export async function POST(request: NextRequest) {
     return notFoundResponse();
   }
 
-  const result = await syncSchedulerCronJobLifecycle();
+  const result = await syncSchedulerCronJobLifecycle({ force: true });
   if (!result.ok && result.status === "error") {
     if (isRateLimitResult(result)) {
       return NextResponse.json({
