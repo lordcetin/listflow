@@ -39,8 +39,15 @@ type CronJobPayload = {
 
 type CronJobSummary = {
   jobId: number;
+  enabled?: boolean;
   title?: string;
   url?: string;
+  lastStatus?: number;
+  lastDuration?: number;
+  lastExecution?: number;
+  nextExecution?: number;
+  requestMethod?: number;
+  schedule?: CronJobSchedule;
 };
 
 type CronJobListItem = CronJobSummary;
@@ -113,6 +120,23 @@ type WebhookConfigRow = {
 type MappingSnapshot = {
   webhookConfigId: string;
   mappedAt: string | null;
+};
+
+export type DirectAutomationCronJob = {
+  jobId: number;
+  enabled: boolean;
+  title: string;
+  url: string;
+  requestMethod: number;
+  lastStatus: number | null;
+  lastDuration: number | null;
+  lastExecution: number | null;
+  nextExecution: number | null;
+  schedule: CronJobSchedule | null;
+  subscriptionId: string | null;
+  storeId: string | null;
+  webhookConfigId: string | null;
+  plan: string | null;
 };
 
 const stripTrailingSlashes = (value: string) => value.replace(/\/+$/, "");
@@ -342,6 +366,27 @@ const buildAutomationTitle = (args: {
 
 const isAutomationManagedTitle = (title: string | null | undefined) =>
   Boolean(title && title.startsWith(LISTFLOW_AUTOMATION_TITLE_PREFIX));
+
+const parseAutomationTitle = (title: string | null | undefined) => {
+  if (!title || !title.startsWith(LISTFLOW_AUTOMATION_TITLE_PREFIX)) {
+    return {
+      subscriptionId: null,
+      storeId: null,
+      webhookConfigId: null,
+      plan: null,
+    };
+  }
+
+  const raw = title.slice(LISTFLOW_AUTOMATION_TITLE_PREFIX.length);
+  const parts = raw.split("::");
+
+  return {
+    subscriptionId: parts[0] ?? null,
+    storeId: parts[1] ?? null,
+    webhookConfigId: parts[2] ?? null,
+    plan: parts[3] ?? null,
+  };
+};
 
 const loadActiveSubscriptions = async () => {
   const withStoreId = await supabaseAdmin
@@ -692,6 +737,48 @@ const syncDirectAutomationCronJobs = async (apiKey: string): Promise<DirectAutom
       details: error instanceof Error ? error.message : "Bilinmeyen hata",
     };
   }
+};
+
+export const loadDirectAutomationCronJobs = async () => {
+  const apiKey = resolveCronApiKey();
+  if (!apiKey) {
+    throw new Error("Cron API key bulunamadı.");
+  }
+
+  const listResponse = await callCronJobOrgApi<CronJobListResponse>({
+    method: "GET",
+    path: "/jobs",
+    apiKey,
+  });
+
+  const rows = ((listResponse.jobs ?? []) as CronJobSummary[])
+    .filter((job) => isAutomationManagedTitle(job.title))
+    .map((job) => {
+      const parsed = parseAutomationTitle(job.title ?? null);
+      return {
+        jobId: job.jobId,
+        enabled: job.enabled !== false,
+        title: job.title ?? "",
+        url: job.url ?? "",
+        requestMethod: job.requestMethod ?? POST_REQUEST_METHOD,
+        lastStatus: job.lastStatus ?? null,
+        lastDuration: job.lastDuration ?? null,
+        lastExecution: job.lastExecution ?? null,
+        nextExecution: job.nextExecution ?? null,
+        schedule: job.schedule ?? null,
+        subscriptionId: parsed.subscriptionId,
+        storeId: parsed.storeId,
+        webhookConfigId: parsed.webhookConfigId,
+        plan: parsed.plan,
+      } satisfies DirectAutomationCronJob;
+    })
+    .sort((a, b) => {
+      const aNext = a.nextExecution ?? 0;
+      const bNext = b.nextExecution ?? 0;
+      return aNext - bNext;
+    });
+
+  return rows;
 };
 
 const findExistingSchedulerJobId = async (apiKey: string) => {

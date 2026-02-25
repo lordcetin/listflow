@@ -106,6 +106,27 @@ type CronTestWebhookRow = {
   next_run_at: string | null;
 };
 
+type DirectCronJobRow = {
+  jobId: number;
+  enabled: boolean;
+  title: string;
+  url: string;
+  requestMethod: number;
+  lastStatus: number | null;
+  lastDuration: number | null;
+  lastExecution: number | null;
+  nextExecution: number | null;
+  schedule: {
+    timezone: string;
+    hours: number[];
+    minutes: number[];
+  } | null;
+  subscriptionId: string | null;
+  storeId: string | null;
+  webhookConfigId: string | null;
+  plan: string | null;
+};
+
 type CronTestTriggerResult = {
   ok?: boolean;
   status?: number | null;
@@ -126,6 +147,11 @@ type OverviewResponse = {
 
 type CronTestListResponse = {
   rows?: CronTestWebhookRow[];
+  error?: string;
+};
+
+type DirectCronListResponse = {
+  rows?: DirectCronJobRow[];
   error?: string;
 };
 
@@ -151,6 +177,19 @@ const formatDate = (value: string | null | undefined) => {
   if (!value) return "-";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleString("tr-TR");
+};
+
+const formatUnixDate = (value: number | null | undefined) => {
+  if (!value || value <= 0) {
+    return "-";
+  }
+
+  const date = new Date(value * 1000);
+  if (Number.isNaN(date.getTime())) {
+    return "-";
+  }
+
   return date.toLocaleString("tr-TR");
 };
 
@@ -292,6 +331,7 @@ export default function AdminWebhookConsolePage() {
   const [testOpen, setTestOpen] = useState(false);
   const [cronTestOpen, setCronTestOpen] = useState(false);
   const [cronTestWebhooks, setCronTestWebhooks] = useState<CronTestWebhookRow[]>([]);
+  const [directCronJobs, setDirectCronJobs] = useState<DirectCronJobRow[]>([]);
   const [cronTestName, setCronTestName] = useState("");
   const [cronTestTargetUrl, setCronTestTargetUrl] = useState("");
   const [cronTestMethod, setCronTestMethod] = useState<"GET" | "POST">("POST");
@@ -324,6 +364,17 @@ export default function AdminWebhookConsolePage() {
     setCronTestWebhooks(payload.rows ?? []);
   }, []);
 
+  const loadDirectCronJobs = useCallback(async () => {
+    const response = await fetch("/api/admin/webhooks/cron/direct-jobs", { cache: "no-store" });
+    const payload = (await response.json().catch(() => ({}))) as DirectCronListResponse;
+
+    if (!response.ok) {
+      throw new Error(payload.error || "Direct cron job listesi yüklenemedi.");
+    }
+
+    setDirectCronJobs(payload.rows ?? []);
+  }, []);
+
   const loadOverview = useCallback(async (options?: { silent?: boolean }) => {
     const silent = options?.silent === true;
 
@@ -336,6 +387,7 @@ export default function AdminWebhookConsolePage() {
       const [overviewResponse] = await Promise.all([
         fetch("/api/admin/webhooks/overview", { cache: "no-store" }),
         loadCronTestWebhooks(),
+        loadDirectCronJobs(),
       ]);
       const payload = (await overviewResponse.json()) as OverviewResponse;
 
@@ -355,7 +407,7 @@ export default function AdminWebhookConsolePage() {
         setLoading(false);
       }
     }
-  }, [loadCronTestWebhooks]);
+  }, [loadCronTestWebhooks, loadDirectCronJobs]);
 
   useEffect(() => {
     void loadOverview();
@@ -442,13 +494,19 @@ export default function AdminWebhookConsolePage() {
         }),
       });
 
-      const body = (await response.json()) as { error?: string } & CronSyncResponse;
+      const body = (await response.json()) as {
+        error?: string;
+        directBootstrap?: { attempted: number; success: number; failed: number };
+      } & CronSyncResponse;
 
       if (!response.ok) {
         throw new Error(body.error || "Webhook kaydedilemedi.");
       }
 
-      setInfo(buildCronSyncMessage("Webhook kaydedildi.", body.cronSync));
+      const bootstrapSummary = body.directBootstrap
+        ? ` İlk tetikleme: ${body.directBootstrap.success}/${body.directBootstrap.attempted} başarılı.`
+        : "";
+      setInfo(`${buildCronSyncMessage("Webhook kaydedildi.", body.cronSync)}${bootstrapSummary}`);
       setCreateTargetUrl("");
       await loadOverview();
     } catch (err) {
@@ -1165,6 +1223,104 @@ export default function AdminWebhookConsolePage() {
     []
   );
 
+  const storeNameById = useMemo(
+    () =>
+      new Map(
+        jobs
+          .filter((row) => Boolean(row.store_id))
+          .map((row) => [row.store_id as string, row.store_name || row.store_id || "-"])
+      ),
+    [jobs]
+  );
+
+  const directCronStats = useMemo(() => {
+    const total = directCronJobs.length;
+    const enabled = directCronJobs.filter((row) => row.enabled).length;
+    const neverRun = directCronJobs.filter((row) => !row.lastExecution || row.lastExecution <= 0).length;
+    const failed = directCronJobs.filter((row) => row.lastStatus !== null && row.lastStatus !== 1 && row.lastStatus !== 0).length;
+    const nextRunAt = directCronJobs
+      .map((row) => row.nextExecution ?? 0)
+      .filter((value) => value > 0)
+      .sort((a, b) => a - b)[0] ?? null;
+
+    return {
+      total,
+      enabled,
+      neverRun,
+      failed,
+      nextRunAt,
+    };
+  }, [directCronJobs]);
+
+  const directCronColumns = useMemo<ColumnDef<DirectCronJobRow>[]>(
+    () => [
+      {
+        accessorKey: "jobId",
+        header: "Job",
+        cell: ({ row }) => (
+          <div className="space-y-1">
+            <p className="font-black text-white">#{row.original.jobId}</p>
+            <p className="text-xs text-slate-500 break-all">{row.original.title}</p>
+          </div>
+        ),
+      },
+      {
+        accessorKey: "storeId",
+        header: "Mağaza",
+        cell: ({ row }) => (
+          <div className="space-y-1">
+            <p className="text-xs text-slate-200 break-all">{row.original.storeId || "-"}</p>
+            <p className="text-xs text-slate-500">{(row.original.storeId && storeNameById.get(row.original.storeId)) || "-"}</p>
+          </div>
+        ),
+      },
+      {
+        accessorKey: "plan",
+        header: "Plan",
+        cell: ({ row }) => <Badge variant="secondary">{(row.original.plan || "-").toUpperCase()}</Badge>,
+      },
+      {
+        accessorKey: "webhookConfigId",
+        header: "Webhook",
+        cell: ({ row }) => {
+          const cfg = row.original.webhookConfigId ? configMap.get(row.original.webhookConfigId) : null;
+          return (
+            <div className="space-y-1">
+              <p className="text-xs break-all">{row.original.webhookConfigId || "-"}</p>
+              <p className="text-xs text-slate-500">{cfg?.name || "-"}</p>
+            </div>
+          );
+        },
+      },
+      {
+        accessorKey: "url",
+        header: "Target URL",
+        cell: ({ row }) => <span className="text-xs break-all">{row.original.url || "-"}</span>,
+      },
+      {
+        accessorKey: "nextExecution",
+        header: "Sonraki Çalışma",
+        cell: ({ row }) => <span>{formatUnixDate(row.original.nextExecution)}</span>,
+      },
+      {
+        accessorKey: "lastExecution",
+        header: "Son Çalışma",
+        cell: ({ row }) => <span>{formatUnixDate(row.original.lastExecution)}</span>,
+      },
+      {
+        accessorKey: "lastStatus",
+        header: "Son Durum",
+        cell: ({ row }) => {
+          const status = row.original.lastStatus;
+          const label = status === 1 ? "OK" : status === 0 ? "Bekliyor" : `Hata (${status ?? "-"})`;
+          const variant = status === 1 ? "success" : status === 0 ? "warning" : "destructive";
+          return <Badge variant={variant}>{label}</Badge>;
+        },
+      },
+    ],
+    [configMap, storeNameById]
+  );
+
   return (
     <div className="space-y-6">
       <Card className="glass-card-pro rounded-[32px]">
@@ -1219,6 +1375,7 @@ export default function AdminWebhookConsolePage() {
               <TabsTrigger value="console">Console</TabsTrigger>
               <TabsTrigger value="transitions">Geçiş Logları</TabsTrigger>
               <TabsTrigger value="scheduler">Zamanlayıcı</TabsTrigger>
+              <TabsTrigger value="direct-cron">Direct Cron Jobs</TabsTrigger>
               <TabsTrigger value="cron">Cron Tick</TabsTrigger>
             </TabsList>
 
@@ -1319,6 +1476,23 @@ export default function AdminWebhookConsolePage() {
                 statusFilterKey="status"
                 dateFilterKey="run_at"
                 dateFilterLabel="Çalışma Tarihi"
+              />
+            </TabsContent>
+
+            <TabsContent value="direct-cron" className="space-y-3">
+              <div className="flex flex-wrap gap-2">
+                <Badge variant="secondary">Toplam Job: {directCronStats.total}</Badge>
+                <Badge variant="success">Aktif: {directCronStats.enabled}</Badge>
+                <Badge variant="warning">Henüz Çalışmamış: {directCronStats.neverRun}</Badge>
+                <Badge variant="destructive">Son Durum Hatalı: {directCronStats.failed}</Badge>
+                <Badge variant="outline">En Yakın Çalışma: {formatUnixDate(directCronStats.nextRunAt)}</Badge>
+              </div>
+
+              <DataTable
+                columns={directCronColumns}
+                data={directCronJobs}
+                searchPlaceholder="Direct cron job ara..."
+                pageSize={10}
               />
             </TabsContent>
 

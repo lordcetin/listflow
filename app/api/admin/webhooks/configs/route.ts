@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAdminRequest, notFoundResponse } from "@/lib/auth/admin-request";
+import { dispatchN8nTrigger } from "@/lib/n8n/client";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 import { persistWebhookConfigProductMap } from "@/lib/webhooks/config-product-map";
 import { syncSchedulerCronJobLifecycle } from "@/lib/cron-job-org/client";
@@ -15,6 +16,15 @@ type ConfigPayload = {
   description?: unknown;
   enabled?: unknown;
   productId?: unknown;
+};
+
+type WebhookConfigForDispatch = {
+  id: string;
+  target_url: string;
+  method: string | null;
+  headers: Record<string, unknown> | null;
+  enabled: boolean | null;
+  scope?: string | null;
 };
 
 const isRecoverableColumnError = (error: QueryError | null | undefined) => {
@@ -304,6 +314,7 @@ const autoBindWebhookToActiveStores = async (args: {
   let logMappings = 0;
   let skippedAlreadyMapped = 0;
   let forceReboundCount = 0;
+  const mappedStoreIds: string[] = [];
   const forceRebindSingleStore = storeIds.length === 1;
 
   for (const storeId of storeIds) {
@@ -340,14 +351,166 @@ const autoBindWebhookToActiveStores = async (args: {
     }
 
     mappedCount += 1;
+    mappedStoreIds.push(storeId);
   }
 
   return {
     mappedCount,
+    mappedStoreIds,
     storeColumnUpdates,
     logMappings,
     skippedAlreadyMapped,
     forceReboundCount,
+  };
+};
+
+const loadWebhookConfigForDispatch = async (id: string) => {
+  const candidates = [
+    "id,target_url,method,headers,enabled,scope",
+    "id,target_url,method,headers,enabled",
+    "id,target_url,method,enabled,scope",
+    "id,target_url,method,enabled",
+    "id,target_url,method,headers",
+    "id,target_url,method",
+  ] as const;
+
+  for (const select of candidates) {
+    const { data, error } = await supabaseAdmin
+      .from("webhook_configs")
+      .select(select)
+      .eq("id", id)
+      .maybeSingle<WebhookConfigForDispatch>();
+
+    if (!error) {
+      return data;
+    }
+
+    if (!isRecoverableColumnError(error)) {
+      throw new Error(error.message ?? "webhook config could not be loaded");
+    }
+  }
+
+  return null;
+};
+
+const persistDirectBootstrapLog = async (args: {
+  url: string;
+  method: "GET" | "POST";
+  storeId: string;
+  webhookConfigId: string;
+  responseStatus: number | null;
+  responseBody: string | null;
+  durationMs: number;
+  createdBy: string;
+}) => {
+  const payloads: Array<Record<string, unknown>> = [
+    {
+      request_url: args.url,
+      request_method: "DIRECT_BOOTSTRAP",
+      request_headers: {},
+      request_body: {
+        client_id: args.storeId,
+        webhook_config_id: args.webhookConfigId,
+      },
+      response_status: args.responseStatus,
+      response_body: args.responseBody,
+      duration_ms: args.durationMs,
+      created_by: args.createdBy,
+    },
+    {
+      request_url: args.url,
+      request_method: "DIRECT_BOOTSTRAP",
+      request_body: {
+        client_id: args.storeId,
+        webhook_config_id: args.webhookConfigId,
+      },
+      response_status: args.responseStatus,
+      response_body: args.responseBody,
+      duration_ms: args.durationMs,
+    },
+  ];
+
+  for (const payload of payloads) {
+    const { error } = await supabaseAdmin.from("webhook_logs").insert(payload);
+    if (!error) {
+      return;
+    }
+    if (!isRecoverableColumnError(error)) {
+      return;
+    }
+  }
+};
+
+const triggerDirectBootstrapDispatch = async (args: {
+  webhookConfigId: string;
+  storeIds: string[];
+  createdBy: string;
+}) => {
+  if (!args.storeIds.length) {
+    return { attempted: 0, success: 0, failed: 0 };
+  }
+
+  const webhook = await loadWebhookConfigForDispatch(args.webhookConfigId);
+  if (!webhook || webhook.enabled === false || webhook.scope === "generic") {
+    return { attempted: 0, success: 0, failed: 0 };
+  }
+
+  const method = webhook.method?.toUpperCase() === "GET" ? "GET" : "POST";
+  let attempted = 0;
+  let success = 0;
+  let failed = 0;
+
+  for (const storeId of args.storeIds.slice(0, 100)) {
+    attempted += 1;
+    const startedAt = Date.now();
+    const idempotencyKey = `direct_bootstrap:${storeId}:${args.webhookConfigId}:${Math.floor(Date.now() / 60_000)}`;
+
+    try {
+      const dispatch = await dispatchN8nTrigger({
+        url: webhook.target_url,
+        method,
+        headers: webhook.headers ?? {},
+        payload: { client_id: storeId },
+        idempotencyKey,
+        triggeredAt: new Date().toISOString(),
+      });
+
+      if (dispatch.ok) {
+        success += 1;
+      } else {
+        failed += 1;
+      }
+
+      await persistDirectBootstrapLog({
+        url: webhook.target_url,
+        method,
+        storeId,
+        webhookConfigId: args.webhookConfigId,
+        responseStatus: dispatch.status,
+        responseBody: dispatch.body,
+        durationMs: Date.now() - startedAt,
+        createdBy: args.createdBy,
+      });
+    } catch (error) {
+      failed += 1;
+      const message = error instanceof Error ? error.message : "direct bootstrap failed";
+      await persistDirectBootstrapLog({
+        url: webhook.target_url,
+        method,
+        storeId,
+        webhookConfigId: args.webhookConfigId,
+        responseStatus: null,
+        responseBody: message,
+        durationMs: Date.now() - startedAt,
+        createdBy: args.createdBy,
+      });
+    }
+  }
+
+  return {
+    attempted,
+    success,
+    failed,
   };
 };
 
@@ -529,9 +692,17 @@ export async function POST(request: NextRequest) {
               webhookConfigId: data.id,
               adminUserId: admin.user.id,
             })
-          : { mappedCount: 0, storeColumnUpdates: 0, logMappings: 0, skippedAlreadyMapped: 0, forceReboundCount: 0 };
+          : { mappedCount: 0, mappedStoreIds: [], storeColumnUpdates: 0, logMappings: 0, skippedAlreadyMapped: 0, forceReboundCount: 0 };
+        const directBootstrap =
+          data?.id && payload.enabled
+            ? await triggerDirectBootstrapDispatch({
+                webhookConfigId: data.id,
+                storeIds: autoBind.mappedStoreIds,
+                createdBy: admin.user.id,
+              })
+            : { attempted: 0, success: 0, failed: 0 };
         const cronSync = await syncSchedulerCronJobLifecycle();
-        return NextResponse.json({ row: data, cronSync, autoBind });
+        return NextResponse.json({ row: data, cronSync, autoBind, directBootstrap });
       }
 
       if (error.code === "23505") {
