@@ -6,10 +6,11 @@ import { resolvePublicSiteUrl } from "@/lib/url/public-site";
 const CRON_JOB_ORG_BASE_URL = "https://api.cron-job.org";
 const LISTFLOW_SCHEDULER_TITLE = "Listflow Scheduler Tick";
 const LISTFLOW_AUTOMATION_TITLE_PREFIX = "Listflow Automation::";
-const CRON_TEST_NAME_PREFIX = "CRON_TEST_2M::";
 const GET_REQUEST_METHOD = 0;
 const POST_REQUEST_METHOD = 1;
 const DEFAULT_AUTOMATION_MODE = "direct";
+const PAGE_SIZE = 1000;
+const IN_FILTER_CHUNK_SIZE = 200;
 
 type CronJobSchedule = {
   timezone: string;
@@ -80,6 +81,7 @@ type DirectAutomationSyncResult =
       ok: true;
       created: number;
       updated: number;
+      unchanged: number;
       deleted: number;
       desired: number;
       existingManaged: number;
@@ -267,19 +269,6 @@ const isMissingColumnError = (error: { message?: string } | null | undefined, co
   return message.includes("column") && message.includes(columnName.toLowerCase());
 };
 
-const isMissingTableError = (error: { code?: string | null; message?: string } | null | undefined) => {
-  if (!error) {
-    return false;
-  }
-
-  const message = (error.message ?? "").toLowerCase();
-  return (
-    error.code === "42P01" ||
-    message.includes("could not find the table") ||
-    (message.includes("relation") && message.includes("does not exist"))
-  );
-};
-
 const parseCronJobApiError = async (response: Response) => {
   const text = await response.text();
   if (!text) {
@@ -389,31 +378,46 @@ const parseAutomationTitle = (title: string | null | undefined) => {
 };
 
 const loadActiveSubscriptions = async () => {
-  const withStoreId = await supabaseAdmin
-    .from("subscriptions")
-    .select("id, plan, status, current_period_end, store_id, shop_id, updated_at, created_at")
-    .in("status", ["active", "trialing"])
-    .limit(5000);
+  const collect = async (select: string) => {
+    const rows: ActiveSubscriptionRow[] = [];
+    let from = 0;
 
-  if (!withStoreId.error) {
-    return (withStoreId.data ?? []) as ActiveSubscriptionRow[];
+    while (true) {
+      const to = from + PAGE_SIZE - 1;
+      const page = await supabaseAdmin
+        .from("subscriptions")
+        .select(select)
+        .in("status", ["active", "trialing"])
+        .order("id", { ascending: true })
+        .range(from, to);
+
+      if (page.error) {
+        throw page.error;
+      }
+
+      const data = (page.data ?? []) as unknown as ActiveSubscriptionRow[];
+      rows.push(...data);
+
+      if (data.length < PAGE_SIZE) {
+        break;
+      }
+
+      from += PAGE_SIZE;
+    }
+
+    return rows;
+  };
+
+  try {
+    return await collect("id, plan, status, current_period_end, store_id, shop_id, updated_at, created_at");
+  } catch (error) {
+    if (!isMissingColumnError(error as { message?: string }, "store_id")) {
+      throw error;
+    }
   }
 
-  if (!isMissingColumnError(withStoreId.error, "store_id")) {
-    throw withStoreId.error;
-  }
-
-  const fallback = await supabaseAdmin
-    .from("subscriptions")
-    .select("id, plan, status, current_period_end, shop_id, updated_at, created_at")
-    .in("status", ["active", "trialing"])
-    .limit(5000);
-
-  if (fallback.error) {
-    throw fallback.error;
-  }
-
-  return ((fallback.data ?? []) as ActiveSubscriptionRow[]).map((row) => ({
+  const fallbackRows = await collect("id, plan, status, current_period_end, shop_id, updated_at, created_at");
+  return fallbackRows.map((row) => ({
     ...row,
     store_id: row.shop_id ?? null,
   }));
@@ -431,29 +435,42 @@ const loadStoreBindings = async (storeIds: string[]) => {
     { select: "id", hasWebhookColumn: false, hasUpdatedAtColumn: false },
   ] as const;
 
+  const chunks: string[][] = [];
+  for (let index = 0; index < storeIds.length; index += IN_FILTER_CHUNK_SIZE) {
+    chunks.push(storeIds.slice(index, index + IN_FILTER_CHUNK_SIZE));
+  }
+
   for (const candidate of candidates) {
-    const query = await supabaseAdmin.from("stores").select(candidate.select).in("id", storeIds);
-    if (query.error) {
-      if (!isMissingColumnError(query.error, "active_webhook_config_id") && !isMissingColumnError(query.error, "automation_updated_at")) {
-        throw query.error;
+    const map = new Map<string, StoreBindingRow>();
+    let useNextCandidate = false;
+
+    for (const chunk of chunks) {
+      const query = await supabaseAdmin.from("stores").select(candidate.select).in("id", chunk);
+      if (query.error) {
+        if (!isMissingColumnError(query.error, "active_webhook_config_id") && !isMissingColumnError(query.error, "automation_updated_at")) {
+          throw query.error;
+        }
+        useNextCandidate = true;
+        break;
       }
-      continue;
+
+      const rows = (query.data ?? []) as unknown as Array<{
+        id: string;
+        active_webhook_config_id?: string | null;
+        automation_updated_at?: string | null;
+      }>;
+      for (const row of rows) {
+        map.set(row.id, {
+          id: row.id,
+          active_webhook_config_id: candidate.hasWebhookColumn ? row.active_webhook_config_id ?? null : null,
+          automation_updated_at: candidate.hasUpdatedAtColumn ? row.automation_updated_at ?? null : null,
+        });
+      }
     }
 
-    const rows = (query.data ?? []) as unknown as Array<{
-      id: string;
-      active_webhook_config_id?: string | null;
-      automation_updated_at?: string | null;
-    }>;
-    const map = new Map<string, StoreBindingRow>();
-    for (const row of rows) {
-      map.set(row.id, {
-        id: row.id,
-        active_webhook_config_id: candidate.hasWebhookColumn ? row.active_webhook_config_id ?? null : null,
-        automation_updated_at: candidate.hasUpdatedAtColumn ? row.automation_updated_at ?? null : null,
-      });
+    if (!useNextCandidate) {
+      return map;
     }
-    return map;
   }
 
   return new Map<string, StoreBindingRow>();
@@ -511,72 +528,102 @@ const loadActiveAutomationWebhookConfigs = async () => {
   ] as const;
 
   for (const select of candidates) {
-    const query = supabaseAdmin
-      .from("webhook_configs")
-      .select(select)
-      .order("updated_at", { ascending: false })
-      .limit(5000);
-
     const hasScope = select.includes("scope");
-    const scoped = hasScope ? query.or("scope.eq.automation,scope.is.null") : query;
-    const { data, error } = await scoped;
-
-    if (error) {
-      if (!isMissingColumnError(error, "scope") && !isMissingColumnError(error, "enabled") && !isMissingColumnError(error, "headers")) {
-        throw error;
-      }
-      continue;
-    }
-
-    const rows = (data ?? []) as unknown as WebhookConfigRow[];
     const map = new Map<string, WebhookConfigRow>();
-    for (const row of rows) {
-      if (row.enabled === false) {
-        continue;
+    let from = 0;
+    let useNextCandidate = false;
+
+    while (true) {
+      const to = from + PAGE_SIZE - 1;
+      const query = supabaseAdmin
+        .from("webhook_configs")
+        .select(select)
+        .order("id", { ascending: true })
+        .range(from, to);
+
+      const scoped = hasScope ? query.or("scope.eq.automation,scope.is.null") : query;
+      const { data, error } = await scoped;
+
+      if (error) {
+        if (!isMissingColumnError(error, "scope") && !isMissingColumnError(error, "enabled") && !isMissingColumnError(error, "headers")) {
+          throw error;
+        }
+        useNextCandidate = true;
+        break;
       }
-      if ((row.scope ?? "automation") === "generic") {
-        continue;
+
+      const rows = (data ?? []) as unknown as WebhookConfigRow[];
+      for (const row of rows) {
+        if (row.enabled === false) {
+          continue;
+        }
+        if ((row.scope ?? "automation") === "generic") {
+          continue;
+        }
+        if (!row.target_url) {
+          continue;
+        }
+        map.set(row.id, row);
       }
-      if (!row.target_url) {
-        continue;
+
+      if (rows.length < PAGE_SIZE) {
+        break;
       }
-      map.set(row.id, row);
+      from += PAGE_SIZE;
     }
-    return map;
+
+    if (!useNextCandidate) {
+      return map;
+    }
   }
 
   return new Map<string, WebhookConfigRow>();
 };
 
-const loadEnabledCronTestWebhookCount = async () => {
-  const withNameAndEnabled = await supabaseAdmin
-    .from("webhook_configs")
-    .select("id", { count: "exact", head: true })
-    .eq("enabled", true)
-    .ilike("name", `${CRON_TEST_NAME_PREFIX}%`);
+const normalizeNumberArray = (value: number[] | null | undefined) =>
+  Array.from(new Set((value ?? []).map((item) => Number(item)).filter((item) => Number.isFinite(item)))).sort(
+    (a, b) => a - b
+  );
 
-  if (!withNameAndEnabled.error) {
-    return withNameAndEnabled.count ?? 0;
+const sameNumberArray = (left: number[] | null | undefined, right: number[] | null | undefined) => {
+  const l = normalizeNumberArray(left);
+  const r = normalizeNumberArray(right);
+  if (l.length !== r.length) {
+    return false;
   }
 
-  if (isMissingTableError(withNameAndEnabled.error)) {
-    return 0;
-  }
-
-  const fallback = await supabaseAdmin
-    .from("webhook_configs")
-    .select("id,name", { count: "exact" })
-    .limit(5000);
-
-  if (fallback.error) {
-    if (isMissingTableError(fallback.error)) {
-      return 0;
+  for (let index = 0; index < l.length; index += 1) {
+    if (l[index] !== r[index]) {
+      return false;
     }
-    throw fallback.error;
   }
 
-  const rows = (fallback.data ?? []) as Array<{ id: string; name?: string | null }>;
-  return rows.filter((row) => (row.name ?? "").startsWith(CRON_TEST_NAME_PREFIX)).length;
+  return true;
+};
+
+const hasSameSchedule = (current: CronJobSchedule | undefined, desired: CronJobSchedule) => {
+  if (!current) {
+    return false;
+  }
+
+  return (
+    (current.timezone ?? "UTC") === (desired.timezone ?? "UTC") &&
+    (current.expiresAt ?? 0) === (desired.expiresAt ?? 0) &&
+    sameNumberArray(current.hours, desired.hours) &&
+    sameNumberArray(current.minutes, desired.minutes) &&
+    sameNumberArray(current.mdays, desired.mdays) &&
+    sameNumberArray(current.months, desired.months) &&
+    sameNumberArray(current.wdays, desired.wdays)
+  );
+};
+
+const shouldUpdateManagedJob = (existing: CronJobListItem, desired: CronJobPayload) => {
+  const urlChanged = (existing.url ?? "").trim() !== desired.url.trim();
+  const methodChanged = (existing.requestMethod ?? POST_REQUEST_METHOD) !== desired.requestMethod;
+  const enabledChanged = (existing.enabled ?? true) !== desired.enabled;
+  const scheduleChanged = !hasSameSchedule(existing.schedule, desired.schedule);
+
+  return urlChanged || methodChanged || enabledChanged || scheduleChanged;
 };
 
 const syncDirectAutomationCronJobs = async (apiKey: string): Promise<DirectAutomationSyncResult> => {
@@ -683,18 +730,23 @@ const syncDirectAutomationCronJobs = async (apiKey: string): Promise<DirectAutom
 
     let created = 0;
     let updated = 0;
+    let unchanged = 0;
     let deleted = 0;
 
     for (const [title, payload] of desiredByTitle.entries()) {
       const existing = managedByTitle.get(title);
       if (existing) {
-        await callCronJobOrgApi<Record<string, never>>({
-          method: "PATCH",
-          path: `/jobs/${existing.jobId}`,
-          body: { job: payload },
-          apiKey,
-        });
-        updated += 1;
+        if (shouldUpdateManagedJob(existing, payload)) {
+          await callCronJobOrgApi<Record<string, never>>({
+            method: "PATCH",
+            path: `/jobs/${existing.jobId}`,
+            body: { job: payload },
+            apiKey,
+          });
+          updated += 1;
+        } else {
+          unchanged += 1;
+        }
         continue;
       }
 
@@ -725,10 +777,11 @@ const syncDirectAutomationCronJobs = async (apiKey: string): Promise<DirectAutom
       ok: true,
       created,
       updated,
+      unchanged,
       deleted,
       desired: desiredByTitle.size,
       existingManaged: managedJobs.length,
-      message: `Direct cron senkronu tamamlandı (desired=${desiredByTitle.size}, created=${created}, updated=${updated}, deleted=${deleted}).`,
+      message: `Direct cron senkronu tamamlandı (desired=${desiredByTitle.size}, created=${created}, updated=${updated}, unchanged=${unchanged}, deleted=${deleted}).`,
     };
   } catch (error) {
     return {
@@ -937,25 +990,20 @@ export const syncSchedulerCronJobLifecycle = async (): Promise<SchedulerCronSync
   }
 
   try {
-    const directResult = isDirectAutomationMode() ? await syncDirectAutomationCronJobs(apiKey) : null;
+    const schedulerResult = await ensureSchedulerCronJob();
 
+    if (!schedulerResult.ok) {
+      return schedulerResult;
+    }
+
+    const directResult = isDirectAutomationMode() ? await syncDirectAutomationCronJobs(apiKey) : null;
     if (directResult && !directResult.ok) {
       return {
         ok: false,
         status: "error",
-        message: directResult.message,
+        message: `${schedulerResult.message} ${directResult.message}`,
         details: directResult.details,
       };
-    }
-
-    const cronTestCount = await loadEnabledCronTestWebhookCount();
-    const schedulerResult =
-      cronTestCount > 0
-        ? await ensureSchedulerCronJob()
-        : await deleteSchedulerCronJob();
-
-    if (!schedulerResult.ok) {
-      return schedulerResult;
     }
 
     if (directResult) {
